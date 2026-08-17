@@ -2,8 +2,15 @@
 
 Elixir's migration for Cordis(AKA. Framework for DeepSeek Harness).
 
-Implements the core library of *A Programming Paradigm for Spatiotemporal
+An umbrella implementing *A Programming Paradigm for Spatiotemporal
 Composability* on the BEAM:
+
+- `apps/dexterous` — **core library**: revertible effects + reactive
+  coeffects + the fiber lifecycle
+- `apps/dexterous_loader` — **component loader**: declarative configuration,
+  reconciliation, groups
+
+## Core (`dexterous`)
 
 - **Revertible effects** (temporal composability): `Dexterous.Context.effect/2`
   is the sole mutation primitive; every effect carries an inverse, tracked on
@@ -16,14 +23,28 @@ Composability* on the BEAM:
   (paper Algorithm 5). Unloading a provider drains its dependents before its
   inverses run; unloading a parent cascades to its children.
 
-## Semantic Alignment and Components
+### Semantic Alignment and Components
 
-- **Core**
-  - Context -> `Dexterous.Context`(immutable struct)+ shared store in ETS(`Dexterous.Store`)
-  - State Machine -> `:gen_statem`(`Dexterous.Fiber`)
-  - Component DSL -> `use Dexterous.Component, inject: [...]`
-- **Loader**(not yet)
-- **HMR**(not yet)
+- Context -> `Dexterous.Context`(immutable struct)+ shared store in ETS(`Dexterous.Store`)
+- State Machine -> `:gen_statem`(`Dexterous.Fiber`)
+- Component DSL -> `use Dexterous.Component, inject: [...]`
+
+## Loader (`dexterous_loader`)
+
+An orchestrator declares the desired composition as a list of
+`DexterousLoader.Entry` records (`id / component / config / disabled /
+isolate / intercept`); `DexterousLoader.reconcile/2` diffs by `id` and
+applies the least disruptive operation. `DexterousLoader.Group` is an
+ordinary component whose config is a list of child entries, so nested trees
+stay within the calculus.
+
+First-cut simplifications versus the paper:
+
+- entries are immutable positions: moving an entry between groups is
+  delete + recreate, so managed-realm reassignment (Algorithm 7) is skipped
+- a changed entry is rebuilt wholesale; per-field incremental updates
+  (e.g. config diffing inside the component) are left to the component
+- HMR is not implemented yet
 
 ## Example
 
@@ -47,7 +68,11 @@ defmodule Consumer do
   end
 end
 
-ctx = Dexterous.root()
-{:ok, _consumer} = Dexterous.use(ctx, Consumer, [])   # waits inactive
-{:ok, _service} = Dexterous.use(ctx, Service, value: 1) # consumer activates
+{:ok, loader} =
+  DexterousLoader.start_link(Dexterous.root(), [
+    %DexterousLoader.Entry{id: :svc, component: Service, config: [value: 1]},
+    %DexterousLoader.Entry{id: :use, component: Consumer, config: []}
+  ])
+
+:ok = DexterousLoader.reconcile(loader, [/* new desired entries */])
 ```
