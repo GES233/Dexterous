@@ -59,8 +59,16 @@ defmodule Dexterous.Context do
         notify(ctx, [key])
 
         fn ->
-          Store.unbind(realm)
-          notify(ctx, [key])
+          # Only retract the binding if it is still ours: a replacement may
+          # have rebound the realm while our unload was in flight.
+          case Store.lookup(realm) do
+            {:ok, %{provider: provider}} when provider == ctx.fiber ->
+              Store.unbind(realm)
+              notify(ctx, [key])
+
+            _ ->
+              :ok
+          end
         end
       end)
 

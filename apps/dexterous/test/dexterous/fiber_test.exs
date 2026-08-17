@@ -178,6 +178,21 @@ defmodule Dexterous.FiberTest do
     end
   end
 
+  test "a late unbind does not wipe out a replacement binding" do
+    ctx = Context.new()
+    {:ok, service_a} = Context.use(ctx, Service, test: self(), value: :a)
+    assert_receive {:service_applied, :a}
+    {:ok, service_b} = Context.use(ctx, Service, test: self(), value: :b)
+    assert_receive {:service_applied, :b}
+
+    # A's unload finishes after B has rebound the same realm.
+    Fiber.retire(service_a)
+    assert_receive {:service_disposed, :a}
+
+    assert {:ok, :b} = Context.get(ctx, :service)
+    assert %{state: :active} = Fiber.status(service_b)
+  end
+
   test "use Dexterous.Component declares the coeffect specification" do
     assert BadFetch.inject() == []
     assert Consumer.inject() == [:service]
