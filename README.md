@@ -9,6 +9,8 @@ Composability* on the BEAM:
   coeffects + the fiber lifecycle
 - `apps/dexterous_loader` — **component loader**: declarative configuration,
   reconciliation, groups
+- `apps/demo` — a minimal composable app (Clock + Reporter) exercising the
+  whole flow; run `mix run examples/demo.exs` from the umbrella root
 
 ## Core (`dexterous`)
 
