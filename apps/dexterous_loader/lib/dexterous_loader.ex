@@ -74,8 +74,18 @@ defmodule DexterousLoader do
           %{entry: old, pid: pid} when old == entry and not entry.disabled ->
             {id, %{entry: entry, pid: pid}}
 
-          stale ->
-            if stale, do: Dexterous.Fiber.retire(stale.pid)
+          %{entry: old, pid: pid} = stale ->
+            if config_only_change?(old, entry) and updatable?(entry.component) do
+              # Paper Section 5.2.1: a config change is handed to the
+              # component, which decides how to apply the new payload.
+              Dexterous.Fiber.reconfigure(pid, entry.config)
+              {id, %{entry: entry, pid: pid}}
+            else
+              Dexterous.Fiber.retire(stale.pid)
+              {id, spawn(state.ctx, entry)}
+            end
+
+          nil ->
             {id, spawn(state.ctx, entry)}
         end
       end)
@@ -99,6 +109,18 @@ defmodule DexterousLoader do
 
   defp spawn(ctx, %Entry{} = entry) do
     %{entry: entry, pid: spawn_entry(ctx, entry)}
+  end
+
+  # Everything but the payload is identical: identity, component, realm and
+  # interception annotations, and the disabled flag.
+  defp config_only_change?(old, new) do
+    old.component == new.component and old.isolate == new.isolate and
+      old.intercept == new.intercept and old.disabled == new.disabled and
+      old.config != new.config
+  end
+
+  defp updatable?(component) do
+    Code.ensure_loaded?(component) and function_exported?(component, :update, 3)
   end
 
   defp apply_annotations(ctx, entry) do
