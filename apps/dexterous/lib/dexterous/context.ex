@@ -2,14 +2,16 @@ defmodule Dexterous.Context do
   @moduledoc """
   The first-class context of the context paradigm.
 
-  A context is an immutable struct carrying two inherited tables:
+  A context is an immutable struct carrying:
 
+    * `:scope` — the composition root this context belongs to (defaults to
+      the node name); the shared store is partitioned by scope
     * `:isolate` — maps a coeffect key to its realm (the store indirection)
     * `:intercept` — maps a coeffect key to interception metadata
 
-  The value store itself lives in `Dexterous.Store` (ETS) and is shared.
-  Deriving a child context (`isolate/3`, `intercept/3`) copies the struct, so
-  recovery is implicit: discarding the child is enough.
+  The value store itself lives in `Dexterous.Store` (ETS) and is shared per
+  scope. Deriving a child context (`isolate/3`, `intercept/3`) copies the
+  struct, so recovery is implicit: discarding the child is enough.
 
   Every mutation of the shared store flows through `effect/2`, the sole
   effect primitive, which tracks an inverse per effect so that unloading
@@ -18,18 +20,24 @@ defmodule Dexterous.Context do
 
   alias Dexterous.Store
 
-  defstruct fiber: nil, isolate: %{}, intercept: %{}
+  defstruct fiber: nil, isolate: %{}, intercept: %{}, scope: node()
 
   @type key :: term()
   @type realm :: term()
+  @type scope :: term()
   @type t :: %__MODULE__{
           fiber: term() | nil,
           isolate: %{key() => realm()},
-          intercept: %{key() => map()}
+          intercept: %{key() => map()},
+          scope: scope()
         }
 
-  @doc "The root context, not owned by any fiber."
-  def new, do: %__MODULE__{}
+  @doc """
+  The root context, not owned by any fiber. `scope` defaults to the node
+  name; pass an explicit name to run an independent composition root in the
+  same VM.
+  """
+  def new(scope \\ node()), do: %__MODULE__{scope: scope}
 
   @doc "The realm a key resolves to in this context."
   def realm_for(%__MODULE__{isolate: isolate}, key), do: Map.get(isolate, key, key)
@@ -41,7 +49,7 @@ defmodule Dexterous.Context do
   the store. Returns `{:ok, value}` or `:error`; never raises.
   """
   def get(%__MODULE__{} = ctx, key) do
-    with {:ok, %{value: value}} <- Store.lookup(realm_for(ctx, key)) do
+    with {:ok, %{value: value}} <- Store.lookup(ctx.scope, realm_for(ctx, key)) do
       {:ok, value}
     end
   end
@@ -55,15 +63,15 @@ defmodule Dexterous.Context do
     {:ok, _disposer} =
       effect(ctx, fn ctx ->
         realm = realm_for(ctx, key)
-        Store.bind(realm, %{key: key, value: value, provider: ctx.fiber})
+        Store.bind(ctx.scope, realm, %{key: key, value: value, provider: ctx.fiber})
         notify(ctx, [key])
 
         fn ->
           # Only retract the binding if it is still ours: a replacement may
           # have rebound the realm while our unload was in flight.
-          case Store.lookup(realm) do
+          case Store.lookup(ctx.scope, realm) do
             {:ok, %{provider: provider}} when provider == ctx.fiber ->
-              Store.unbind(realm)
+              Store.unbind(ctx.scope, realm)
               notify(ctx, [key])
 
             _ ->
@@ -92,6 +100,111 @@ defmodule Dexterous.Context do
   end
 
   @doc """
+  Authorized context access (Algorithm 6): walk the fiber chain upward from
+  the accessing context. The first fiber whose committed view binds `key`
+  authorizes the access; a fiber that declares `key` without having committed
+  it raises `Dexterous.InactiveAccessError`; reaching the root without any
+  declaration raises `Dexterous.UndeclaredAccessError`.
+  """
+  def fetch!(%__MODULE__{} = ctx, key) do
+    case walk(ctx.scope, ctx.fiber, key) do
+      {:ok, value} -> value
+      :inactive -> raise Dexterous.InactiveAccessError, key: key
+      :undeclared -> raise Dexterous.UndeclaredAccessError, key: key
+    end
+  end
+
+  defp walk(_scope, nil, _key), do: :undeclared
+
+  defp walk(scope, fiber_id, key) do
+    case Store.get_fiber(scope, fiber_id) do
+      {:ok, fiber} ->
+        cond do
+          is_map(fiber.committed) and Map.has_key?(fiber.committed, key) ->
+            {:ok, Map.fetch!(fiber.committed, key)}
+
+          key in fiber.inject ->
+            :inactive
+
+          true ->
+            walk(scope, fiber.parent, key)
+        end
+
+      :error ->
+        :undeclared
+    end
+  end
+
+  ## Effect tracking
+
+  @doc """
+  Run `callback` as a revertible effect: the callback may return an inverse
+  `-> any`, which the runtime pushes onto the owning fiber's disposer stack
+  (or `:root`'s). Returns `{:ok, disposer}`; invoking the disposer recovers
+  the effect, at most once, and halts it from firing again at unload time.
+  """
+  def effect(%__MODULE__{} = ctx, callback) when is_function(callback, 1) do
+    owner = ctx.fiber || :root
+
+    case callback.(ctx) do
+      inverse when is_function(inverse, 0) ->
+        disposer = once(inverse)
+        Store.push_disposer(ctx.scope, owner, disposer)
+        {:ok, disposer}
+
+      _other ->
+        {:ok, fn -> :ok end}
+    end
+  end
+
+  @doc """
+  Track a process as an effect of this context: when the owner unloads, the
+  process is stopped. Sugar over `effect/2` for the common case of a
+  component starting its own processes in `apply/2`.
+
+      def apply(ctx, _config) do
+        {:ok, worker} = MyWorker.start_link([])
+        Dexterous.Context.track(ctx, worker)
+      end
+  """
+  def track(%__MODULE__{} = ctx, pid, reason \\ :normal) when is_pid(pid) do
+    effect(ctx, fn _ctx ->
+      fn ->
+        if Process.alive?(pid) do
+          try do
+            GenServer.stop(pid, reason)
+          catch
+            :exit, _ -> :ok
+          end
+        end
+
+        :ok
+      end
+    end)
+  end
+
+  @doc """
+  Propagate binding changes to dependents: any live fiber that injects one of
+  `keys` and resolves it to the same realm as this context gets refreshed.
+  Returns the ids of the affected fibers, so a caller can wait for them.
+  """
+  def notify(%__MODULE__{} = ctx, keys) do
+    ctx.scope
+    |> Store.all_fibers()
+    |> Enum.filter(fn {_id, fiber} ->
+      Enum.any?(keys, fn key ->
+        key in fiber.inject and Map.get(fiber.isolate, key, key) == realm_for(ctx, key)
+      end)
+    end)
+    |> Enum.map(fn {id, fiber} ->
+      GenServer.cast(fiber.pid, :refresh)
+      id
+    end)
+  end
+
+  ## Component instantiation
+
+  @doc """
   Instantiate a component as a fiber on this context (Algorithm 4). The
   component pairs a coeffect specification `inject/0` with an effect function
   `apply/2`. Instantiation is itself a tracked effect of the parent context:
@@ -117,82 +230,6 @@ defmodule Dexterous.Context do
       end)
 
     {:ok, pid}
-  end
-
-  @doc """
-  Authorized context access (Algorithm 6): walk the fiber chain upward from
-  the accessing context. The first fiber whose committed view binds `key`
-  authorizes the access; a fiber that declares `key` without having committed
-  it raises `Dexterous.InactiveAccessError`; reaching the root without any
-  declaration raises `Dexterous.UndeclaredAccessError`.
-  """
-  def fetch!(%__MODULE__{} = ctx, key) do
-    case walk(ctx.fiber, key) do
-      {:ok, value} -> value
-      :inactive -> raise Dexterous.InactiveAccessError, key: key
-      :undeclared -> raise Dexterous.UndeclaredAccessError, key: key
-    end
-  end
-
-  defp walk(nil, _key), do: :undeclared
-
-  defp walk(fiber_id, key) do
-    case Store.get_fiber(fiber_id) do
-      {:ok, fiber} ->
-        cond do
-          is_map(fiber.committed) and Map.has_key?(fiber.committed, key) ->
-            {:ok, Map.fetch!(fiber.committed, key)}
-
-          key in fiber.inject ->
-            :inactive
-
-          true ->
-            walk(fiber.parent, key)
-        end
-
-      :error ->
-        :undeclared
-    end
-  end
-
-  ## Effect tracking
-
-  @doc """
-  Run `callback` as a revertible effect: the callback may return an inverse
-  `-> any`, which the runtime pushes onto the owning fiber's disposer stack
-  (or `:root`'s). Returns `{:ok, disposer}`; invoking the disposer recovers
-  the effect, at most once, and halts it from firing again at unload time.
-  """
-  def effect(%__MODULE__{} = ctx, callback) when is_function(callback, 1) do
-    owner = ctx.fiber || :root
-
-    case callback.(ctx) do
-      inverse when is_function(inverse, 0) ->
-        disposer = once(inverse)
-        Store.push_disposer(owner, disposer)
-        {:ok, disposer}
-
-      _other ->
-        {:ok, fn -> :ok end}
-    end
-  end
-
-  @doc """
-  Propagate binding changes to dependents: any live fiber that injects one of
-  `keys` and resolves it to the same realm as this context gets refreshed.
-  Returns the ids of the affected fibers, so a caller can wait for them.
-  """
-  def notify(%__MODULE__{} = ctx, keys) do
-    Store.all_fibers()
-    |> Enum.filter(fn {_id, fiber} ->
-      Enum.any?(keys, fn key ->
-        key in fiber.inject and Map.get(fiber.isolate, key, key) == realm_for(ctx, key)
-      end)
-    end)
-    |> Enum.map(fn {id, fiber} ->
-      GenServer.cast(fiber.pid, :refresh)
-      id
-    end)
   end
 
   ## Internal

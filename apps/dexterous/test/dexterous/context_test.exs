@@ -5,8 +5,7 @@ defmodule Dexterous.ContextTest do
 
   setup do
     # Each test starts from a clean store.
-    for {realm, _} <- :ets.tab2list(:dexterous_store), do: Store.unbind(realm)
-    :ok = Store.take_disposers(:root) |> Enum.each(& &1.())
+    :ok = Store.reset(node())
     :ok
   end
 
@@ -21,7 +20,7 @@ defmodule Dexterous.ContextTest do
     ctx = Context.new()
     :ok = Context.set(ctx, :theme, "dark")
 
-    [disposer] = Store.take_disposers(:root)
+    [disposer] = Store.take_disposers(node(), :root)
     disposer.()
 
     assert :error = Context.get(ctx, :theme)
@@ -34,7 +33,7 @@ defmodule Dexterous.ContextTest do
     {:ok, _} = Context.effect(ctx, fn _ -> fn -> send(test_pid, {:disposed, 1}) end end)
     {:ok, _} = Context.effect(ctx, fn _ -> fn -> send(test_pid, {:disposed, 2}) end end)
 
-    Store.take_disposers(:root) |> Enum.each(& &1.())
+    Store.take_disposers(node(), :root) |> Enum.each(& &1.())
 
     assert_received {:disposed, 2}
     assert_received {:disposed, 1}
@@ -80,5 +79,38 @@ defmodule Dexterous.ContextTest do
 
     assert ctx.intercept[:database] == %{timeout: 1000, readonly: false}
     assert child.intercept[:database] == %{timeout: 1000, readonly: true}
+  end
+
+  test "scopes partition the store" do
+    on_exit(fn -> Store.reset(:other_scope) end)
+
+    a = Context.new()
+    b = Context.new(:other_scope)
+
+    :ok = Context.set(a, :theme, "dark")
+    assert {:ok, "dark"} = Context.get(a, :theme)
+    assert :error = Context.get(b, :theme)
+
+    :ok = Context.set(b, :theme, "light")
+    assert {:ok, "dark"} = Context.get(a, :theme)
+    assert {:ok, "light"} = Context.get(b, :theme)
+  end
+
+  test "track/2 stops the process when the owner unloads" do
+    ctx = Context.new()
+    {:ok, agent} = Agent.start_link(fn -> :ok end)
+    {:ok, _disposer} = Context.track(ctx, agent)
+
+    Store.take_disposers(node(), :root) |> Enum.each(& &1.())
+    refute Process.alive?(agent)
+  end
+
+  test "track/2 tolerates an already-dead process" do
+    ctx = Context.new()
+    {:ok, agent} = Agent.start_link(fn -> :ok end)
+    {:ok, disposer} = Context.track(ctx, agent)
+    Agent.stop(agent)
+
+    assert :ok = disposer.()
   end
 end

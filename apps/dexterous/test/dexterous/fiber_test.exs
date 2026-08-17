@@ -70,9 +70,7 @@ defmodule Dexterous.FiberTest do
       DynamicSupervisor.terminate_child(Dexterous.FiberSup, pid)
     end
 
-    :ets.delete_all_objects(:dexterous_store)
-    :ets.delete_all_objects(:dexterous_fibers)
-    :ets.delete_all_objects(:dexterous_disposers)
+    Dexterous.Store.reset(node())
     :ok
   end
 

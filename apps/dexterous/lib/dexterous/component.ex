@@ -31,6 +31,21 @@ defmodule Dexterous.Component do
   """
   @callback apply(Dexterous.Context.t(), config :: term()) :: term()
 
+  @doc """
+  Optional. When the loader sees a config-only change for an entry whose
+  component exports this callback, the new payload is handed to the running
+  fiber instead of rebuilding it (paper Section 5.2.1). Return `:ok` to keep
+  the fiber running with the new config, or `:reload` to rebuild in place.
+
+  Effects performed through the context here are tracked like in `apply/2`.
+  A raised exception moves the fiber to `:failed` after recovering its
+  effects.
+  """
+  @callback update(Dexterous.Context.t(), old_config :: term(), new_config :: term()) ::
+              :ok | :reload
+
+  @optional_callbacks update: 3
+
   defmacro __using__(opts) do
     inject = Keyword.get(opts, :inject, [])
 

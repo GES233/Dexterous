@@ -25,6 +25,8 @@ defmodule Dexterous.Fiber do
     :inject,
     :apply_pid,
     :apply_mon,
+    :update_pid,
+    :update_mon,
     target: :unsatisfied,
     target0: nil,
     committed: nil,
@@ -51,7 +53,15 @@ defmodule Dexterous.Fiber do
   @doc "Ask the fiber to unload and retire: unload, then exit and drop from the runtime."
   def retire(pid), do: GenServer.cast(pid, :retire)
 
-  @doc "Introspection: `%{state:, target:, committed:}`."
+  @doc """
+  Hand a new config to the fiber (paper Section 5.2.1): if the component
+  exports `update/3`, it decides how to apply the new payload (`:ok` keeps
+  the fiber running, `:reload` rebuilds it in place); otherwise the fiber is
+  rebuilt via unload + reload.
+  """
+  def reconfigure(pid, config), do: GenServer.cast(pid, {:reconfigure, config})
+
+  @doc "Introspection: `%{id:, state:, target:, committed:, last_error:}`."
   def status(pid), do: :gen_statem.call(pid, :status)
 
   ## gen_statem callbacks
@@ -63,7 +73,7 @@ defmodule Dexterous.Fiber do
   def init({id, ctx, parent, component, config}) do
     inject = component.inject()
 
-    Store.register_fiber(id, %{
+    Store.register_fiber(ctx.scope, id, %{
       pid: self(),
       parent: parent,
       inject: inject,
@@ -99,7 +109,7 @@ defmodule Dexterous.Fiber do
   end
 
   def handle_event(:cast, :refresh, state, data) do
-    new_target = resolve_target(data.inject, data.ctx.isolate)
+    new_target = resolve_target(data.ctx.scope, data.inject, data.ctx.isolate)
 
     cond do
       data.retiring ->
@@ -112,7 +122,7 @@ defmodule Dexterous.Fiber do
         # Idempotent: a neutral change is harmless.
         :keep_state_and_data
 
-      state in [:loading, :unloading] ->
+      state in [:loading, :unloading] or data.update_pid != nil ->
         # Inertia: record the new target, let the transition complete.
         {:keep_state, %{data | target: new_target}}
 
@@ -130,10 +140,26 @@ defmodule Dexterous.Fiber do
     case state do
       :inactive -> stop_fiber(data)
       :failed -> stop_fiber(data)
-      :active -> start_unload(data)
+      :active -> if_busy(data, &start_unload/1)
       :loading -> {:keep_state, data}
       :unloading -> {:keep_state, data}
     end
+  end
+
+  def handle_event(:cast, {:reconfigure, new_config}, :active, %{update_pid: nil} = data) do
+    if updatable?(data.component) do
+      start_update(data, new_config)
+    else
+      # No update/3: rebuild in place. The target digest is unchanged, so
+      # finish_unload chains straight into reload with the new config.
+      start_unload(%{data | config: new_config})
+    end
+  end
+
+  def handle_event(:cast, {:reconfigure, _new_config}, _state, _data) do
+    # Only an active, settled fiber takes a new config; a loader should
+    # rebuild fibers in any other state.
+    :keep_state_and_data
   end
 
   def handle_event(:cast, {:notify_inactive, waiter, waiter_id}, state, data) do
@@ -160,8 +186,8 @@ defmodule Dexterous.Fiber do
     case result do
       :ok ->
         if data.target == data.target0 do
-          Store.update_fiber(data.id, %{state: :active})
-          Context.notify(data.ctx, Store.keys_provided_by(data.id))
+          Store.update_fiber(data.ctx.scope, data.id, %{state: :active})
+          Context.notify(data.ctx, Store.keys_provided_by(data.ctx.scope, data.id))
           {:next_state, :active, data}
         else
           # The target moved while apply ran: chain into unload.
@@ -170,9 +196,44 @@ defmodule Dexterous.Fiber do
 
       {:error, reason} ->
         recover(data)
-        Store.update_fiber(data.id, %{state: :failed, committed: nil})
+        Store.update_fiber(data.ctx.scope, data.id, %{state: :failed, committed: nil})
         data = %{data | target: :unsatisfied, last_error: reason, waiters: notify_waiters(data)}
         {:next_state, :failed, data}
+    end
+  end
+
+  def handle_event(
+        :info,
+        {:update_done, pid, result, new_config},
+        :active,
+        %{
+          update_pid: pid
+        } = data
+      ) do
+    Process.demonitor(data.update_mon, [:flush])
+    data = %{data | update_pid: nil, update_mon: nil}
+
+    case result do
+      :ok ->
+        data = %{data | config: new_config}
+
+        if data.retiring do
+          start_unload(data)
+        else
+          # The component absorbed the new payload; re-evaluate the target in
+          # case it moved while the update ran.
+          GenServer.cast(self(), :refresh)
+          {:keep_state, data}
+        end
+
+      :reload ->
+        start_unload(%{data | config: new_config})
+
+      {:error, reason} ->
+        recover(data)
+        Store.update_fiber(data.ctx.scope, data.id, %{state: :failed, committed: nil})
+        data = %{data | target: :unsatisfied, last_error: reason, waiters: notify_waiters(data)}
+        if data.retiring, do: stop_fiber(data), else: {:next_state, :failed, data}
     end
   end
 
@@ -186,6 +247,23 @@ defmodule Dexterous.Fiber do
         } = data
       ) do
     handle_event(:info, {:apply_done, pid, {:error, reason}}, :loading, data)
+  end
+
+  def handle_event(
+        :info,
+        {:DOWN, mon, :process, pid, reason},
+        :active,
+        %{
+          update_pid: pid,
+          update_mon: mon
+        } = data
+      ) do
+    Process.demonitor(mon, [:flush])
+    data = %{data | update_pid: nil, update_mon: nil}
+    recover(data)
+    Store.update_fiber(data.ctx.scope, data.id, %{state: :failed, committed: nil})
+    data = %{data | target: :unsatisfied, last_error: reason, waiters: notify_waiters(data)}
+    {:next_state, :failed, data}
   end
 
   def handle_event(:info, {:fiber_inactive, dependent}, :unloading, data) do
@@ -209,8 +287,9 @@ defmodule Dexterous.Fiber do
   # transitions inertial), then check the target at completion.
   defp start_reload(data) do
     target0 = data.target
-    committed = resolve_view(data.inject, data.ctx.isolate)
-    Store.update_fiber(data.id, %{state: :loading, committed: committed})
+    scope = data.ctx.scope
+    committed = resolve_view(scope, data.inject, data.ctx.isolate)
+    Store.update_fiber(scope, data.id, %{state: :loading, committed: committed})
 
     statem = self()
     %{component: component, ctx: ctx, config: config} = data
@@ -234,16 +313,43 @@ defmodule Dexterous.Fiber do
      %{data | target0: target0, committed: committed, apply_pid: pid, apply_mon: mon}}
   end
 
+  # update: hand the new config to the component itself (paper Section 5.2.1),
+  # in a separate process so the state machine stays responsive.
+  defp start_update(data, new_config) do
+    statem = self()
+    %{component: component, ctx: ctx, config: old_config} = data
+
+    {pid, mon} =
+      spawn_monitor(fn ->
+        result =
+          try do
+            case component.update(ctx, old_config, new_config) do
+              :reload -> :reload
+              _ -> :ok
+            end
+          rescue
+            exception -> {:error, {exception, __STACKTRACE__}}
+          catch
+            kind, reason -> {:error, {kind, reason}}
+          end
+
+        send(statem, {:update_done, self(), result, new_config})
+      end)
+
+    {:keep_state, %{data | update_pid: pid, update_mon: mon}}
+  end
+
   # unload: the fiber stops providing *before* any inverse is scheduled, its
   # dependents are notified and drained, and only then are the tracked
   # inverses run in LIFO order.
   defp start_unload(data) do
-    Store.update_fiber(data.id, %{state: :unloading})
-    affected = Context.notify(data.ctx, Store.keys_provided_by(data.id))
+    scope = data.ctx.scope
+    Store.update_fiber(scope, data.id, %{state: :unloading})
+    affected = Context.notify(data.ctx, Store.keys_provided_by(scope, data.id))
 
     pending =
       MapSet.new(affected, fn dep ->
-        case Store.get_fiber(dep) do
+        case Store.get_fiber(scope, dep) do
           {:ok, %{pid: pid}} -> GenServer.cast(pid, {:notify_inactive, self(), data.id})
           :error -> :ok
         end
@@ -262,7 +368,7 @@ defmodule Dexterous.Fiber do
 
   defp finish_unload(data) do
     recover(data)
-    Store.update_fiber(data.id, %{state: :inactive, committed: nil})
+    Store.update_fiber(data.ctx.scope, data.id, %{state: :inactive, committed: nil})
     data = %{data | committed: nil, waiters: notify_waiters(data)}
 
     cond do
@@ -273,16 +379,24 @@ defmodule Dexterous.Fiber do
   end
 
   defp stop_fiber(data) do
-    Store.delete_fiber(data.id)
+    Store.delete_fiber(data.ctx.scope, data.id)
     {:stop, :normal, data}
   end
 
   ## Helpers
 
+  defp if_busy(data, fun) do
+    if data.update_pid != nil, do: {:keep_state, data}, else: fun.(data)
+  end
+
+  defp updatable?(component) do
+    Code.ensure_loaded?(component) and function_exported?(component, :update, 3)
+  end
+
   # Run the fiber's tracked inverses in LIFO order (the accumulator).
   defp recover(data) do
-    data.id
-    |> Store.take_disposers()
+    data.ctx.scope
+    |> Store.take_disposers(data.id)
     |> Enum.each(fn disposer ->
       try do
         disposer.()
@@ -300,16 +414,16 @@ defmodule Dexterous.Fiber do
   # The target view: for every injected key, the fiber currently providing it,
   # or :unsatisfied. A binding counts as provided only while its provider is
   # :active; bindings installed from the root context are always available.
-  defp resolve_target(inject, isolate) do
+  defp resolve_target(scope, inject, isolate) do
     Enum.reduce_while(inject, {:ok, %{}}, fn key, {:ok, acc} ->
       realm = Map.get(isolate, key, key)
 
-      case Store.lookup(realm) do
+      case Store.lookup(scope, realm) do
         {:ok, %{provider: nil}} ->
           {:cont, {:ok, Map.put(acc, key, :root)}}
 
         {:ok, %{provider: provider}} ->
-          case Store.get_fiber(provider) do
+          case Store.get_fiber(scope, provider) do
             {:ok, %{state: :active}} -> {:cont, {:ok, Map.put(acc, key, provider)}}
             _ -> {:halt, :unsatisfied}
           end
@@ -324,9 +438,9 @@ defmodule Dexterous.Fiber do
     end
   end
 
-  defp resolve_view(inject, isolate) do
+  defp resolve_view(scope, inject, isolate) do
     Map.new(inject, fn key ->
-      {:ok, %{value: value}} = Store.lookup(Map.get(isolate, key, key))
+      {:ok, %{value: value}} = Store.lookup(scope, Map.get(isolate, key, key))
       {key, value}
     end)
   end

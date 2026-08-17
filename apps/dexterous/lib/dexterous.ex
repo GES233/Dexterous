@@ -19,8 +19,12 @@ defmodule Dexterous do
 
   alias Dexterous.Context
 
-  @doc "The root context, not owned by any fiber."
-  def root, do: Context.new()
+  @doc """
+  The root context, not owned by any fiber. `scope` defaults to the node
+  name; pass an explicit name for an independent composition root in the
+  same VM.
+  """
+  def root(scope \\ node()), do: Context.new(scope)
 
   defdelegate get(ctx, key), to: Context
   defdelegate fetch!(ctx, key), to: Context
@@ -29,6 +33,8 @@ defmodule Dexterous do
   defdelegate isolate(ctx, key, realm), to: Context
   defdelegate intercept(ctx, key, metadata), to: Context
   defdelegate effect(ctx, callback), to: Context
+  defdelegate track(ctx, pid), to: Context
+  defdelegate track(ctx, pid, reason), to: Context
   defdelegate use(ctx, component, config), to: Context
   defdelegate notify(ctx, keys), to: Context
 end

@@ -7,6 +7,6 @@ defmodule DexterousTest do
     assert :ok = Dexterous.set(ctx, :facade_key, 1)
     assert {:ok, 1} = Dexterous.get(ctx, :facade_key)
 
-    Dexterous.Store.take_disposers(:root) |> Enum.each(& &1.())
+    Dexterous.Store.take_disposers(node(), :root) |> Enum.each(& &1.())
   end
 end
