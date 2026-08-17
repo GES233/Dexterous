@@ -22,6 +22,11 @@ Composability* on the BEAM:
   the inertial lifecycle `inactive | loading | active | unloading | failed`
   (paper Algorithm 5). Unloading a provider drains its dependents before its
   inverses run; unloading a parent cascades to its children.
+- **Scopes**: the shared store is partitioned by scope; the default scope is
+  the node name. `Dexterous.root(:name)` starts an independent composition
+  root, so several applications can share one VM without seeing each other.
+- **Process tracking**: `Dexterous.Context.track/2` registers a process the
+  component started, so unloading stops it with the rest of the effects.
 
 ### Semantic Alignment and Components
 
@@ -34,16 +39,18 @@ Composability* on the BEAM:
 An orchestrator declares the desired composition as a list of
 `DexterousLoader.Entry` records (`id / component / config / disabled /
 isolate / intercept`); `DexterousLoader.reconcile/2` diffs by `id` and
-applies the least disruptive operation. `DexterousLoader.Group` is an
-ordinary component whose config is a list of child entries, so nested trees
-stay within the calculus.
+applies the least disruptive operation: a config-only change is handed to the
+component's optional `update/3` callback (paper Section 5.2.1), which may
+absorb the payload or answer `:reload`; anything else rebuilds the entry.
+`DexterousLoader.Group` is an ordinary component whose config is a list of
+child entries, so nested trees stay within the calculus.
 
 First-cut simplifications versus the paper:
 
 - entries are immutable positions: moving an entry between groups is
   delete + recreate, so managed-realm reassignment (Algorithm 7) is skipped
-- a changed entry is rebuilt wholesale; per-field incremental updates
-  (e.g. config diffing inside the component) are left to the component
+- interception metadata is stored on contexts but not yet consulted at
+  access time
 - HMR is not implemented yet
 
 ## Example
