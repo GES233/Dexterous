@@ -1,0 +1,2 @@
+# 仓库统一 LF（gitattributes 优先于 core.autocrlf，Windows 检出不再转 CRLF）
+* text=auto eol=lf
