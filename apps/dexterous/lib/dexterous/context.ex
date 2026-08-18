@@ -262,14 +262,22 @@ defmodule Dexterous.Context do
   `apply/2`. Instantiation is itself a tracked effect of the parent context:
   unloading the parent cascades to the child.
   """
-  def use(%__MODULE__{} = ctx, component, config) do
+  def use(ctx, component, config), do: use(ctx, component, config, [])
+
+  @doc """
+  Instantiate a component as a fiber, merging the `:attrs` option into the
+  fiber's initial registry attributes (the loader uses this to record entry
+  bookkeeping atomically with registration).
+  """
+  def use(%__MODULE__{} = ctx, component, config, opts) do
     id = make_ref()
     child_ctx = %{ctx | fiber: id}
+    attrs = Keyword.get(opts, :attrs, %{})
 
     {:ok, pid} =
       DynamicSupervisor.start_child(
         Dexterous.FiberSup,
-        {Dexterous.Fiber, {id, child_ctx, ctx.fiber, component, config}}
+        {Dexterous.Fiber, {id, child_ctx, ctx.fiber, component, config, attrs}}
       )
 
     {:ok, _disposer} =

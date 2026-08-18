@@ -51,7 +51,11 @@ entry's realms in place (paper Algorithm 7, `DexterousLoader.Isolate`),
 moving the bindings the entry owns and notifying exactly the dependents the
 reassignment reaches; anything else rebuilds the entry.
 `DexterousLoader.Group` is an ordinary component whose config is a list of
-child entries, so nested trees stay within the calculus.
+child entries; its config changes apply as a keyed diff over child ids, so
+surviving children keep their fibers. `DexterousLoader.move/3` relocates an
+entry to another group (or the root) while preserving its fiber: the parent
+chain is re-pointed and the realms are reassigned against the new parent via
+the same Algorithm 7 machinery.
 
 Managed realms are deterministic terms: `isolate: %{key => true}` selects a
 local realm `{:local, entry_id, key}` the entry carries wherever it goes, and
@@ -63,8 +67,9 @@ binding the entry owns (it travels) from one it merely shares (it stays).
 
 First-cut simplifications versus the paper:
 
-- moving an entry between groups is still delete + recreate: the fiber's
-  identity is not preserved across groups, though its managed realms are
+- relocating an entry by *editing group configs and reconciling* remains
+  delete + recreate; identity-preserving moves go through the explicit
+  `DexterousLoader.move/3` API (as does cordis's `EntryTree.update/4`)
 - HMR is not implemented yet
 
 ## Example

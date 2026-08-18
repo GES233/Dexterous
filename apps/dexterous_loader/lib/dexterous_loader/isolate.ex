@@ -63,10 +63,21 @@ defmodule DexterousLoader.Isolate do
   Reassign the realms of the entry running as fiber `pid` to what
   `new_entry` declares (Algorithm 7). The fiber keeps its identity, adopts
   the new realm map and config, and reloads; bindings it owns move along.
+
+  `parent_ctx` supplies the *new* parent's realm map and interception
+  metadata: for an in-place isolate change it is the context the entry was
+  spawned on; for a move (`DexterousLoader.move/3`) it carries the target
+  parent's maps. Options:
+
+    * `:intercept` — replace the fiber's interception metadata (used when a
+      move changes what the entry inherits).
   """
-  def patch(%Context{} = parent_ctx, pid, %Entry{} = new_entry) do
+  def patch(parent_ctx, pid, new_entry), do: patch(parent_ctx, pid, new_entry, [])
+
+  def patch(%Context{} = parent_ctx, pid, %Entry{} = new_entry, opts) do
     scope = parent_ctx.scope
     fiber_id = Fiber.status(pid).id
+    intercept = Keyword.get(opts, :intercept)
 
     with {:ok, attrs} <- Store.get_fiber(scope, fiber_id) do
       old_map = attrs.isolate
@@ -77,7 +88,15 @@ defmodule DexterousLoader.Isolate do
         |> Enum.uniq()
         |> Enum.filter(fn key -> Map.get(old_map, key, key) != Map.get(new_map, key, key) end)
 
-      if delta != [] do
+      repatch? = delta != [] or (not is_nil(intercept) and intercept != Map.get(attrs, :intercept))
+
+      if not is_nil(intercept) do
+        Store.update_fiber(scope, fiber_id, %{intercept: intercept})
+      end
+
+      Store.update_fiber(scope, fiber_id, %{entry: new_entry})
+
+      if repatch? do
         # Step 1: fresh delimiter tags for the changed keys, written before
         # the diff reads the providers' tags — a provider inside the entry's
         # scope then resolves to the fresh tag, marking the binding as own.
@@ -96,7 +115,7 @@ defmodule DexterousLoader.Isolate do
           end)
 
         # Step 3: the fiber adopts the new realms and reloads in place.
-        Fiber.patch_isolate(pid, new_map, new_entry.config)
+        Fiber.patch_isolate(pid, new_map, new_entry.config, intercept)
 
         # Step 4: move each binding that is the entry's own, provided the new
         # realm is not already occupied.

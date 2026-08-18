@@ -50,14 +50,14 @@ defmodule Dexterous.Fiber do
 
   ## Public API
 
-  def start_link({id, %Context{} = ctx, parent, component, config}) do
-    :gen_statem.start_link(__MODULE__, {id, ctx, parent, component, config}, [])
+  def start_link({id, %Context{} = ctx, parent, component, config, attrs}) do
+    :gen_statem.start_link(__MODULE__, {id, ctx, parent, component, config, attrs}, [])
   end
 
-  def child_spec({id, ctx, parent, component, config}) do
+  def child_spec({id, ctx, parent, component, config, attrs}) do
     %{
       id: {:dexterous_fiber, id},
-      start: {__MODULE__, :start_link, [{id, ctx, parent, component, config}]},
+      start: {__MODULE__, :start_link, [{id, ctx, parent, component, config, attrs}]},
       restart: :temporary
     }
   end
@@ -78,9 +78,14 @@ defmodule Dexterous.Fiber do
   loader): adopt `isolate` as the fiber's realm map, take `config` as the
   new config, and force a reload even when the resolved target digest is
   unchanged — the committed view must be recomputed against the new realms.
+  `intercept` (when given) replaces the fiber's interception metadata, which
+  is consulted at read time.
   """
   def patch_isolate(pid, isolate, config),
-    do: GenServer.cast(pid, {:patch_isolate, isolate, config})
+    do: GenServer.cast(pid, {:patch_isolate, isolate, config, nil})
+
+  def patch_isolate(pid, isolate, config, intercept),
+    do: GenServer.cast(pid, {:patch_isolate, isolate, config, intercept})
 
   @doc "Introspection: `%{id:, state:, target:, committed:, last_error:}`."
   def status(pid), do: :gen_statem.call(pid, :status)
@@ -91,19 +96,27 @@ defmodule Dexterous.Fiber do
   def callback_mode, do: :handle_event_function
 
   @impl true
-  def init({id, ctx, parent, component, config}) do
+  def init({id, ctx, parent, component, config, attrs}) do
     inject = component.inject()
 
-    Store.register_fiber(ctx.scope, id, %{
-      pid: self(),
-      parent: parent,
-      inject: inject,
-      isolate: ctx.isolate,
-      delimiters: %{},
-      state: :inactive,
-      target: :unsatisfied,
-      committed: nil
-    })
+    Store.register_fiber(
+      ctx.scope,
+      id,
+      Map.merge(
+        %{
+          pid: self(),
+          parent: parent,
+          inject: inject,
+          isolate: ctx.isolate,
+          intercept: ctx.intercept,
+          delimiters: %{},
+          state: :inactive,
+          target: :unsatisfied,
+          committed: nil
+        },
+        attrs
+      )
+    )
 
     {:ok, :inactive,
      %__MODULE__{
@@ -126,6 +139,7 @@ defmodule Dexterous.Fiber do
           state: state,
           target: data.target,
           committed: data.committed,
+          updating: data.update_pid != nil,
           last_error: data.last_error
         }}
      ]}
@@ -194,9 +208,10 @@ defmodule Dexterous.Fiber do
     :keep_state_and_data
   end
 
-  def handle_event(:cast, {:patch_isolate, isolate, config}, state, data) do
+  def handle_event(:cast, {:patch_isolate, isolate, config, intercept}, state, data) do
     scope = data.ctx.scope
     ctx = %{data.ctx | isolate: isolate}
+    ctx = if is_nil(intercept), do: ctx, else: %{ctx | intercept: intercept}
     new_target = resolve_target(scope, data.inject, isolate)
     Store.update_fiber(scope, data.id, %{isolate: isolate, target: new_target})
     data = %{data | ctx: ctx, config: config, target: new_target, force_reload: true}

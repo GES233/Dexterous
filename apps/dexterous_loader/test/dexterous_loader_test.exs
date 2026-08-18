@@ -151,7 +151,7 @@ defmodule DexterousLoaderTest do
     assert_receive {:probe_applied, 1}
   end
 
-  test "a group loads its child entries and rebuilds the subtree on config change" do
+  test "a group config change rebuilds the children whose entries changed" do
     ctx = Dexterous.root()
 
     group = fn label ->

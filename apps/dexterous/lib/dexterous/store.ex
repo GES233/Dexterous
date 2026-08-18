@@ -38,6 +38,17 @@ defmodule Dexterous.Store do
     {:reply, ensure_tables(scope), state}
   end
 
+  def handle_call({:update_fiber, scope, id, attrs}, _from, state) do
+    table = fibers(scope)
+
+    case :ets.lookup(table, id) do
+      [{^id, old}] -> :ets.insert(table, {id, Map.merge(old, attrs)})
+      [] -> :ok
+    end
+
+    {:reply, :ok, state}
+  end
+
   ## Bindings
 
   def bind(scope, realm, entry) when is_map(entry) do
@@ -64,15 +75,10 @@ defmodule Dexterous.Store do
     :ok
   end
 
+  # Serialized through the GenServer: the merge is a read-modify-write, and
+  # fibers, the loader and group diffs all write attributes concurrently.
   def update_fiber(scope, id, attrs) when is_map(attrs) do
-    table = fibers(scope)
-
-    case :ets.lookup(table, id) do
-      [{^id, old}] -> :ets.insert(table, {id, Map.merge(old, attrs)})
-      [] -> :ok
-    end
-
-    :ok
+    GenServer.call(__MODULE__, {:update_fiber, scope, id, attrs})
   end
 
   def delete_fiber(scope, id) do
