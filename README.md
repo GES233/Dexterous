@@ -1,9 +1,9 @@
 # Dexterous
 
-Elixir's migration for Cordis(AKA. Framework for DeepSeek Harness).
+Elixir's migration for [Cordis](https://github.com/cordiverse/cordis) *(AKA. [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)'s framework)*.
 
-An umbrella implementing *A Programming Paradigm for Spatiotemporal
-Composability* on the BEAM:
+An umbrella implementing *[A Programming Paradigm for Spatiotemporal
+Composability](https://github.com/cordiverse/paper)* on the BEAM:
 
 - `apps/dexterous` — **core library**: revertible effects + reactive
   coeffects + the fiber lifecycle
