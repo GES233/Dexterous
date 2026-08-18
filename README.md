@@ -84,5 +84,5 @@ end
     %DexterousLoader.Entry{id: :use, component: Consumer, config: []}
   ])
 
-:ok = DexterousLoader.reconcile(loader, [/* new desired entries */])
+:ok = DexterousLoader.reconcile(loader, [" ...new desired entries "])
 ```
