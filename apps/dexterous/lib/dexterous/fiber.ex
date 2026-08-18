@@ -11,6 +11,11 @@ defmodule Dexterous.Fiber do
   boundary. `data.target` is `:unsatisfied` or a map `%{key => provider_id}`
   — identifying a binding by its provider (a fresh, never-reused id) rather
   than by its value is what makes a single comparison sufficient.
+
+  Step-boundary guard: before each effect applied during `reload`, the
+  in-flight target is compared against the target captured at the start of
+  the transition. If they differ, `Dexterous.HaltedError` is raised so that
+  only the already-applied effects are recovered (paper Algorithm 1).
   """
 
   @behaviour :gen_statem
@@ -79,6 +84,7 @@ defmodule Dexterous.Fiber do
       inject: inject,
       isolate: ctx.isolate,
       state: :inactive,
+      target: :unsatisfied,
       committed: nil
     })
 
@@ -124,6 +130,7 @@ defmodule Dexterous.Fiber do
 
       state in [:loading, :unloading] or data.update_pid != nil ->
         # Inertia: record the new target, let the transition complete.
+        Store.update_fiber(data.ctx.scope, data.id, %{target: new_target})
         {:keep_state, %{data | target: new_target}}
 
       new_target == :unsatisfied ->
@@ -136,6 +143,7 @@ defmodule Dexterous.Fiber do
 
   def handle_event(:cast, :retire, state, data) do
     data = %{data | retiring: true, target: :unsatisfied}
+    Store.update_fiber(data.ctx.scope, data.id, %{target: :unsatisfied})
 
     case state do
       :inactive -> stop_fiber(data)
@@ -193,6 +201,13 @@ defmodule Dexterous.Fiber do
           # The target moved while apply ran: chain into unload.
           start_unload(data)
         end
+
+      {:error, {%Dexterous.HaltedError{}, _}} ->
+        # Step-boundary guard fired: recover what we already applied and then
+        # continue with unload (the target has changed).
+        recover(data)
+        Store.update_fiber(data.ctx.scope, data.id, %{committed: nil})
+        start_unload(%{data | committed: nil})
 
       {:error, reason} ->
         recover(data)
@@ -289,16 +304,27 @@ defmodule Dexterous.Fiber do
     target0 = data.target
     scope = data.ctx.scope
     committed = resolve_view(scope, data.inject, data.ctx.isolate)
-    Store.update_fiber(scope, data.id, %{state: :loading, committed: committed})
+    Store.update_fiber(scope, data.id, %{state: :loading, committed: committed, target: target0})
 
     statem = self()
     %{component: component, ctx: ctx, config: config} = data
+
+    # Step-boundary guard: each effect consults whether the desired target
+    # is still the one this reload was started for.
+    guard = fn ->
+      case Store.get_fiber(scope, ctx.fiber) do
+        {:ok, %{target: ^target0}} -> true
+        _ -> false
+      end
+    end
+
+    apply_ctx = %{ctx | guard: guard}
 
     {pid, mon} =
       spawn_monitor(fn ->
         result =
           try do
-            _ = component.apply(ctx, config)
+            _ = component.apply(apply_ctx, config)
             :ok
           rescue
             exception -> {:error, {exception, __STACKTRACE__}}
@@ -341,7 +367,7 @@ defmodule Dexterous.Fiber do
 
   # unload: the fiber stops providing *before* any inverse is scheduled, its
   # dependents are notified and drained, and only then are the tracked
-  # inverses run in LIFO order.
+  # inverses are run in LIFO order.
   defp start_unload(data) do
     scope = data.ctx.scope
     Store.update_fiber(scope, data.id, %{state: :unloading})

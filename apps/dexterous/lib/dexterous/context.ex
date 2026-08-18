@@ -8,28 +8,32 @@ defmodule Dexterous.Context do
       the node name); the shared store is partitioned by scope
     * `:isolate` — maps a coeffect key to its realm (the store indirection)
     * `:intercept` — maps a coeffect key to interception metadata
+    * `:guard` — an optional `fn -> boolean()` consulted by `effect/3` at
+      every step boundary (paper Algorithm 1 and Section 4.3.2)
 
   The value store itself lives in `Dexterous.Store` (ETS) and is shared per
   scope. Deriving a child context (`isolate/3`, `intercept/3`) copies the
   struct, so recovery is implicit: discarding the child is enough.
 
-  Every mutation of the shared store flows through `effect/2`, the sole
+  Every mutation of the shared store flows through `effect/3`, the sole
   effect primitive, which tracks an inverse per effect so that unloading
   recovers the environment in LIFO order.
   """
 
   alias Dexterous.Store
 
-  defstruct fiber: nil, isolate: %{}, intercept: %{}, scope: node()
+  defstruct fiber: nil, isolate: %{}, intercept: %{}, scope: node(), guard: nil
 
   @type key :: term()
   @type realm :: term()
   @type scope :: term()
+  @type guard :: (() -> boolean())
   @type t :: %__MODULE__{
           fiber: term() | nil,
           isolate: %{key() => realm()},
           intercept: %{key() => map()},
-          scope: scope()
+          scope: scope(),
+          guard: guard() | nil
         }
 
   @doc """
@@ -47,16 +51,20 @@ defmodule Dexterous.Context do
   @doc """
   Read a coeffect binding: resolve the key's realm, then look the realm up in
   the store. Returns `{:ok, value}` or `:error`; never raises.
+
+  If the accessing context carries interception metadata for this key, it is
+  consulted: a `:transform` function is applied to the stored value before
+  returning it.
   """
   def get(%__MODULE__{} = ctx, key) do
     with {:ok, %{value: value}} <- Store.lookup(ctx.scope, realm_for(ctx, key)) do
-      {:ok, value}
+      {:ok, apply_intercept(value, Map.get(ctx.intercept, key))}
     end
   end
 
   @doc """
   Install a coeffect binding. Provision is an effect (paper Section 3.1), so
-  it goes through `effect/2`: the tracked inverse removes the binding. Both
+  it goes through `effect/3`: the tracked inverse removes the binding. Both
   installation and removal notify dependents.
   """
   def set(%__MODULE__{} = ctx, key, value) do
@@ -94,9 +102,23 @@ defmodule Dexterous.Context do
   @doc """
   Derive a child context whose interception metadata for `key` is merged with
   (and takes priority over) what the context already carries.
+
+  At access time (see `fetch!/2` and `get/2`) the effective metadata for the
+  key is consulted. Currently supported metadata:
+
+    * `:transform` — an `fn value -> transformed_value` applied to the stored
+      value whenever it is read through this context.
   """
   def intercept(%__MODULE__{} = ctx, key, metadata) when is_map(metadata) do
     %{ctx | intercept: Map.update(ctx.intercept, key, metadata, &Map.merge(&1, metadata))}
+  end
+
+  @doc """
+  Return the effective interception metadata for `key` as seen by this
+  context (already merged from ancestor contexts by `intercept/3`).
+  """
+  def intercept_for(%__MODULE__{intercept: intercept}, key) do
+    Map.get(intercept, key, %{})
   end
 
   @doc """
@@ -105,29 +127,33 @@ defmodule Dexterous.Context do
   authorizes the access; a fiber that declares `key` without having committed
   it raises `Dexterous.InactiveAccessError`; reaching the root without any
   declaration raises `Dexterous.UndeclaredAccessError`.
+
+  Interception metadata for the key (see `intercept/3`) is applied to the
+  returned value.
   """
   def fetch!(%__MODULE__{} = ctx, key) do
-    case walk(ctx.scope, ctx.fiber, key) do
+    case walk(ctx, ctx.fiber, key) do
       {:ok, value} -> value
       :inactive -> raise Dexterous.InactiveAccessError, key: key
       :undeclared -> raise Dexterous.UndeclaredAccessError, key: key
     end
   end
 
-  defp walk(_scope, nil, _key), do: :undeclared
+  defp walk(_ctx, nil, _key), do: :undeclared
 
-  defp walk(scope, fiber_id, key) do
-    case Store.get_fiber(scope, fiber_id) do
+  defp walk(%__MODULE__{} = ctx, fiber_id, key) do
+    case Store.get_fiber(ctx.scope, fiber_id) do
       {:ok, fiber} ->
         cond do
           is_map(fiber.committed) and Map.has_key?(fiber.committed, key) ->
-            {:ok, Map.fetch!(fiber.committed, key)}
+            value = Map.fetch!(fiber.committed, key)
+            {:ok, apply_intercept(value, Map.get(ctx.intercept, key))}
 
           key in fiber.inject ->
             :inactive
 
           true ->
-            walk(scope, fiber.parent, key)
+            walk(ctx, fiber.parent, key)
         end
 
       :error ->
@@ -138,13 +164,26 @@ defmodule Dexterous.Context do
   ## Effect tracking
 
   @doc """
-  Run `callback` as a revertible effect: the callback may return an inverse
+  Run `callback` as a revertible effect. The callback may return an inverse
   `-> any`, which the runtime pushes onto the owning fiber's disposer stack
   (or `:root`'s). Returns `{:ok, disposer}`; invoking the disposer recovers
   the effect, at most once, and halts it from firing again at unload time.
+
+  Options:
+
+    * `:guard` — an `fn -> boolean()` checked before the callback runs. If it
+      returns `false`, `Dexterous.HaltedError` is raised so that the in-flight
+      effect sequence can be recovered (paper Algorithm 1). When no guard is
+      supplied, the context's own `:guard` field is used; otherwise the effect
+      always proceeds.
   """
-  def effect(%__MODULE__{} = ctx, callback) when is_function(callback, 1) do
+  def effect(%__MODULE__{} = ctx, callback, opts \\ []) when is_function(callback, 1) do
     owner = ctx.fiber || :root
+    guard = Keyword.get(opts, :guard) || ctx.guard || fn -> true end
+
+    unless guard.() do
+      raise Dexterous.HaltedError, message: "effect halted by step-boundary guard"
+    end
 
     case callback.(ctx) do
       inverse when is_function(inverse, 0) ->
@@ -159,7 +198,7 @@ defmodule Dexterous.Context do
 
   @doc """
   Track a process as an effect of this context: when the owner unloads, the
-  process is stopped. Sugar over `effect/2` for the common case of a
+  process is stopped. Sugar over `effect/3` for the common case of a
   component starting its own processes in `apply/2`.
 
       def apply(ctx, _config) do
@@ -233,6 +272,16 @@ defmodule Dexterous.Context do
   end
 
   ## Internal
+
+  # Apply interception metadata to a resolved value. Currently the only
+  # supported key is `:transform`, an Elixir function.
+  defp apply_intercept(value, nil), do: value
+
+  defp apply_intercept(value, %{transform: transform} = _metadata) when is_function(transform, 1) do
+    transform.(value)
+  end
+
+  defp apply_intercept(value, _metadata), do: value
 
   # Wrap an inverse so it fires at most once (the `armed` flag of Algorithm 1):
   # firing twice would apply an inverse at a state no application of the

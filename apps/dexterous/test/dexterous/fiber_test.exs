@@ -1,7 +1,7 @@
 defmodule Dexterous.FiberTest do
   use ExUnit.Case, async: false
 
-  alias Dexterous.{Context, Fiber}
+  alias Dexterous.{Context, Fiber, Store}
 
   defmodule Service do
     @moduledoc "Provides the :service coeffect with its configured value."
@@ -194,5 +194,67 @@ defmodule Dexterous.FiberTest do
   test "use Dexterous.Component declares the coeffect specification" do
     assert BadFetch.inject() == []
     assert Consumer.inject() == [:service]
+  end
+  defmodule StepProvider do
+    @moduledoc "Provides :step_dep."
+    use Dexterous.Component
+
+    @impl true
+    def apply(ctx, config) do
+      Dexterous.Context.set(ctx, :step_dep, config[:value])
+    end
+  end
+
+  defmodule StepConsumer do
+    @moduledoc "Injects :step_dep and performs two guarded effects."
+    use Dexterous.Component, inject: [:step_dep]
+
+    @impl true
+    def apply(ctx, config) do
+      test = config[:test]
+      Dexterous.Context.effect(ctx, fn _ -> fn -> send(test, :step1_disposed) end end)
+      send(test, {:apply_pid, self()})
+      send(test, :step1)
+      receive do
+        :continue -> :ok
+      end
+      Dexterous.Context.effect(ctx, fn _ -> fn -> send(test, :step2_disposed) end end)
+      send(test, :step2)
+    end
+  end
+
+  test "fiber halts apply at step boundary when target changes" do
+    ctx = Context.new()
+    {:ok, provider} = Context.use(ctx, StepProvider, value: 1)
+    {:ok, consumer} = Context.use(ctx, StepConsumer, test: self())
+
+    assert_receive {:apply_pid, apply_pid}
+    assert_receive :step1
+
+    # Retiring the provider changes the consumer's target while it is loading.
+    Fiber.retire(provider)
+
+    consumer_id = Fiber.status(consumer).id
+
+    # Wait until the consumer state machine has recorded the target change;
+    # only then does the step-boundary guard see :unsatisfied.
+    eventually(fn ->
+      case Store.get_fiber(node(), consumer_id) do
+        {:ok, %{target: :unsatisfied}} -> true
+        _ -> nil
+      end
+    end)
+
+    send(apply_pid, :continue)
+
+    # The first effect was applied and then recovered; the second never ran.
+    assert_receive :step1_disposed
+    refute_received :step2
+    refute_received :step2_disposed
+
+    assert eventually(fn ->
+             status = Fiber.status(consumer)
+             if status.state == :inactive, do: status
+           end)
   end
 end

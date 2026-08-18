@@ -4,7 +4,7 @@ defmodule Dexterous do
   paradigm (revertible effects + reactive coeffects).
 
     * Temporal composability: every mutation of the shared context flows
-      through `Dexterous.Context.effect/2`, which tracks an inverse; unloading
+      through `Dexterous.Context.effect/3`, which tracks an inverse; unloading
       a component recovers the environment in LIFO order.
     * Spatial composability: components declare their dependencies
       (`inject/0`) and are notified and re-evaluated whenever a binding they
@@ -32,7 +32,9 @@ defmodule Dexterous do
   defdelegate isolate(ctx, key), to: Context
   defdelegate isolate(ctx, key, realm), to: Context
   defdelegate intercept(ctx, key, metadata), to: Context
+  defdelegate intercept_for(ctx, key), to: Context
   defdelegate effect(ctx, callback), to: Context
+  defdelegate effect(ctx, callback, opts), to: Context
   defdelegate track(ctx, pid), to: Context
   defdelegate track(ctx, pid, reason), to: Context
   defdelegate use(ctx, component, config), to: Context

@@ -113,4 +113,50 @@ defmodule Dexterous.ContextTest do
 
     assert :ok = disposer.()
   end
+  test "get/2 applies an intercept :transform to the stored value" do
+    ctx = Context.new() |> Context.intercept(:theme, %{transform: &String.upcase/1})
+    :ok = Context.set(ctx, :theme, "dark")
+
+    assert {:ok, "DARK"} = Context.get(ctx, :theme)
+    # A context without the interceptor sees the raw value.
+    assert {:ok, "dark"} = Context.get(Context.new(), :theme)
+  end
+
+  test "intercept metadata is merged and child layers take priority" do
+    parent = Context.new() |> Context.intercept(:svc, %{a: 1, b: 2})
+    child = Context.intercept(parent, :svc, %{b: 3, c: 4})
+
+    assert Context.intercept_for(parent, :svc) == %{a: 1, b: 2}
+    assert Context.intercept_for(child, :svc) == %{a: 1, b: 3, c: 4}
+  end
+
+  test "effect/3 with guard halts when the guard returns false" do
+    ctx = Context.new()
+    test_pid = self()
+
+    allow = fn -> Process.get(:allow_effect, true) end
+    {:ok, _} = Context.effect(ctx, fn _ -> fn -> send(test_pid, :a_disposed) end end, guard: allow)
+
+    Process.put(:allow_effect, false)
+
+    assert_raise Dexterous.HaltedError, fn ->
+      Context.effect(ctx, fn _ -> fn -> send(test_pid, :b_disposed) end end, guard: allow)
+    end
+
+    # Only the first inverse is on the stack.
+    [disposer] = Store.take_disposers(node(), :root)
+    disposer.()
+    assert_received :a_disposed
+    refute_received :b_disposed
+  after
+    Process.delete(:allow_effect)
+  end
+
+  test "effect/3 uses the context's guard when none is supplied" do
+    ctx = %{Context.new() | guard: fn -> false end}
+
+    assert_raise Dexterous.HaltedError, fn ->
+      Context.effect(ctx, fn _ -> fn -> :ok end end)
+    end
+  end
 end

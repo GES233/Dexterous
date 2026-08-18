@@ -14,12 +14,15 @@ Composability](https://github.com/cordiverse/paper)* on the BEAM:
 
 ## Core (`dexterous`)
 
-- **Revertible effects** (temporal composability): `Dexterous.Context.effect/2`
+- **Revertible effects** (temporal composability): `Dexterous.Context.effect/3`
   is the sole mutation primitive; every effect carries an inverse, tracked on
-  the owning fiber's disposer stack and run LIFO on unload.
+  the owning fiber's disposer stack and run LIFO on unload. An optional
+  step-boundary `:guard` lets a fiber halt an in-flight effect sequence when its
+  target changes (paper Algorithm 1).
 - **Reactive coeffects** (spatial composability): components declare
   `inject/0`; bindings installed via `Context.set/3` notify dependents, whose
-  fibers re-evaluate reactively.
+  fibers re-evaluate reactively. Interception metadata (e.g. a `:transform`
+  function) set via `Context.intercept/3` is consulted when a key is read.
 - **Fibers**: each component instantiation is a `:gen_statem` process running
   the inertial lifecycle `inactive | loading | active | unloading | failed`
   (paper Algorithm 5). Unloading a provider drains its dependents before its
@@ -51,8 +54,6 @@ First-cut simplifications versus the paper:
 
 - entries are immutable positions: moving an entry between groups is
   delete + recreate, so managed-realm reassignment (Algorithm 7) is skipped
-- interception metadata is stored on contexts but not yet consulted at
-  access time
 - HMR is not implemented yet
 
 ## Example

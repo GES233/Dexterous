@@ -1,3 +1,14 @@
+defmodule Dexterous.HaltedError do
+  @moduledoc """
+  Raised when a step-boundary guard decides that the in-flight effect sequence
+  should stop (paper Algorithm 1 and Section 4.3.2).
+  """
+  defexception [:message]
+
+  @impl true
+  def message(%{message: message}), do: message || "effect halted by guard"
+end
+
 defmodule Dexterous.InactiveAccessError do
   @moduledoc """
   Raised when a fiber accesses a coeffect it declares but has not committed —
