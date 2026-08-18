@@ -16,6 +16,12 @@ defmodule Dexterous.Fiber do
   in-flight target is compared against the target captured at the start of
   the transition. If they differ, `Dexterous.HaltedError` is raised so that
   only the already-applied effects are recovered (paper Algorithm 1).
+
+  Realm reassignment: `patch_isolate/3` (paper Algorithm 7, driven by the
+  loader) swaps the fiber's realm map and forces a reload through unload, so
+  effects tied to the old realms are recovered before the component re-applies
+  against the new ones. The reload is forced even when the target digest is
+  unchanged, since the committed view must be recomputed against new realms.
   """
 
   @behaviour :gen_statem
@@ -38,6 +44,7 @@ defmodule Dexterous.Fiber do
     pending: nil,
     waiters: [],
     retiring: false,
+    force_reload: false,
     last_error: nil
   ]
 
@@ -66,6 +73,15 @@ defmodule Dexterous.Fiber do
   """
   def reconfigure(pid, config), do: GenServer.cast(pid, {:reconfigure, config})
 
+  @doc """
+  Reassign the fiber's realms in place (paper Algorithm 7, driven by the
+  loader): adopt `isolate` as the fiber's realm map, take `config` as the
+  new config, and force a reload even when the resolved target digest is
+  unchanged — the committed view must be recomputed against the new realms.
+  """
+  def patch_isolate(pid, isolate, config),
+    do: GenServer.cast(pid, {:patch_isolate, isolate, config})
+
   @doc "Introspection: `%{id:, state:, target:, committed:, last_error:}`."
   def status(pid), do: :gen_statem.call(pid, :status)
 
@@ -83,6 +99,7 @@ defmodule Dexterous.Fiber do
       parent: parent,
       inject: inject,
       isolate: ctx.isolate,
+      delimiters: %{},
       state: :inactive,
       target: :unsatisfied,
       committed: nil
@@ -123,6 +140,13 @@ defmodule Dexterous.Fiber do
 
       state == :failed ->
         :keep_state_and_data
+
+      data.force_reload and state == :active and data.update_pid == nil ->
+        # A realm reassignment demands a reload even when the target digest
+        # did not change; route through unload so the old realms' effects are
+        # recovered first.
+        Store.update_fiber(data.ctx.scope, data.id, %{target: new_target})
+        start_unload(%{data | target: new_target, force_reload: false})
 
       new_target == data.target ->
         # Idempotent: a neutral change is harmless.
@@ -170,6 +194,36 @@ defmodule Dexterous.Fiber do
     :keep_state_and_data
   end
 
+  def handle_event(:cast, {:patch_isolate, isolate, config}, state, data) do
+    scope = data.ctx.scope
+    ctx = %{data.ctx | isolate: isolate}
+    new_target = resolve_target(scope, data.inject, isolate)
+    Store.update_fiber(scope, data.id, %{isolate: isolate, target: new_target})
+    data = %{data | ctx: ctx, config: config, target: new_target, force_reload: true}
+
+    cond do
+      data.retiring or state == :failed ->
+        {:keep_state, %{data | force_reload: false}}
+
+      state in [:loading, :unloading] or data.update_pid != nil ->
+        # Inertia: the flag forces a reload at the transition boundary.
+        {:keep_state, data}
+
+      state == :inactive ->
+        if new_target == :unsatisfied do
+          # Nothing applied; the next refresh loads against the new realms.
+          {:keep_state, %{data | force_reload: false}}
+        else
+          start_reload(%{data | force_reload: false})
+        end
+
+      state == :active ->
+        # Forced reload in place: unload recovers the old realms' effects,
+        # then finish_unload chains into reload when the target is satisfied.
+        start_unload(%{data | force_reload: false})
+    end
+  end
+
   def handle_event(:cast, {:notify_inactive, waiter, waiter_id}, state, data) do
     cond do
       state in [:inactive, :failed] ->
@@ -193,13 +247,20 @@ defmodule Dexterous.Fiber do
 
     case result do
       :ok ->
-        if data.target == data.target0 do
-          Store.update_fiber(data.ctx.scope, data.id, %{state: :active})
-          Context.notify(data.ctx, Store.keys_provided_by(data.ctx.scope, data.id))
-          {:next_state, :active, data}
-        else
-          # The target moved while apply ran: chain into unload.
-          start_unload(data)
+        cond do
+          data.force_reload ->
+            # A realm reassignment arrived while apply ran: recover this
+            # generation and reload against the new realms.
+            start_unload(%{data | force_reload: false})
+
+          data.target == data.target0 ->
+            Store.update_fiber(data.ctx.scope, data.id, %{state: :active})
+            Context.notify(data.ctx, Store.keys_provided_by(data.ctx.scope, data.id))
+            {:next_state, :active, data}
+
+          true ->
+            # The target moved while apply ran: chain into unload.
+            start_unload(data)
         end
 
       {:error, {%Dexterous.HaltedError{}, _}} ->

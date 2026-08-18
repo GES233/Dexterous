@@ -8,13 +8,14 @@ defmodule DexterousLoader.Entry do
     * `:config` — configuration bound into the component's effect function
     * `:disabled` — administratively turned off
     * `:isolate` — realm annotations, `%{key => true | String.t()}`:
-      `true` asks for a realm private to this entry, a string names a global
-      realm shared by every entry naming it
+      `true` asks for a realm private to this entry (tagged by its id), a
+      string names a global realm shared by every entry naming it; see
+      `DexterousLoader.Isolate`
     * `:intercept` — interception annotations, `%{key => metadata}`
 
-  First-cut simplification: entries are immutable positions in the tree.
-  Moving an entry between groups is expressed as delete + recreate, so the
-  managed-realm reassignment of paper Algorithm 7 is not needed.
+  When reconciliation sees only the `:isolate` field change, the entry's
+  realms are reassigned in place (paper Algorithm 7, `DexterousLoader.Isolate`)
+  instead of rebuilding the fiber.
   """
 
   @enforce_keys [:id, :component]

@@ -10,10 +10,13 @@ defmodule DexterousLoader do
 
     * a new id is instantiated;
     * a vanished id is retired;
-    * an id whose entry changed in any field is rebuilt (retired and
-      re-instantiated) — the least disruptive operation for a `config` change
-      is the component's own concern, and rebuilding is sound: the departing
-      fiber's contribution to the state is nothing (paper Corollary 62).
+    * an id whose entry changed in any other field is rebuilt (retired and
+      re-instantiated) — rebuilding is sound: the departing fiber's
+      contribution to the state is nothing (paper Corollary 62);
+    * a config-only change is handed to the component's `update/3` when it
+      exports one;
+    * an isolate-only change reassigns the entry's realms in place (paper
+      Algorithm 7, `DexterousLoader.Isolate`).
 
   Nested composition goes through `DexterousLoader.Group`, an ordinary
   component whose config is a list of child entries.
@@ -22,7 +25,7 @@ defmodule DexterousLoader do
   use GenServer
 
   alias Dexterous.Context
-  alias DexterousLoader.Entry
+  alias DexterousLoader.{Entry, Isolate}
 
   defstruct ctx: nil, fibers: %{}
 
@@ -75,14 +78,22 @@ defmodule DexterousLoader do
             {id, %{entry: entry, pid: pid}}
 
           %{entry: old, pid: pid} = stale ->
-            if config_only_change?(old, entry) and updatable?(entry.component) do
-              # Paper Section 5.2.1: a config change is handed to the
-              # component, which decides how to apply the new payload.
-              Dexterous.Fiber.reconfigure(pid, entry.config)
-              {id, %{entry: entry, pid: pid}}
-            else
-              Dexterous.Fiber.retire(stale.pid)
-              {id, spawn(state.ctx, entry)}
+            cond do
+              config_only_change?(old, entry) and updatable?(entry.component) ->
+                # Paper Section 5.2.1: a config change is handed to the
+                # component, which decides how to apply the new payload.
+                Dexterous.Fiber.reconfigure(pid, entry.config)
+                {id, %{entry: entry, pid: pid}}
+
+              isolate_change?(old, entry) ->
+                # Paper Algorithm 7: reassign the entry's realms in place; a
+                # config change rides along, absorbed by the forced reload.
+                Isolate.patch(state.ctx, pid, entry)
+                {id, %{entry: entry, pid: pid}}
+
+              true ->
+                Dexterous.Fiber.retire(stale.pid)
+                {id, spawn(state.ctx, entry)}
             end
 
           nil ->
@@ -119,6 +130,15 @@ defmodule DexterousLoader do
       old.config != new.config
   end
 
+  # Identity, component, interception annotations and the disabled flag are
+  # all unchanged, but the realm annotations moved: reassign realms in place
+  # instead of rebuilding. A config change alongside is absorbed by the
+  # reload the reassignment forces.
+  defp isolate_change?(old, new) do
+    old.component == new.component and old.intercept == new.intercept and
+      old.disabled == new.disabled and not new.disabled and old.isolate != new.isolate
+  end
+
   defp updatable?(component) do
     Code.ensure_loaded?(component) and function_exported?(component, :update, 3)
   end
@@ -127,8 +147,7 @@ defmodule DexterousLoader do
     ctx
     |> then(fn c ->
       Enum.reduce(entry.isolate, c, fn
-        {key, true}, c -> Context.isolate(c, key)
-        {key, name}, c when is_binary(name) -> Context.isolate(c, key, {:global, name})
+        {key, annotation}, c -> Context.isolate(c, key, Isolate.realm_for(entry, key, annotation))
       end)
     end)
     |> then(fn c ->

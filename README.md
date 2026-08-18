@@ -46,14 +46,25 @@ An orchestrator declares the desired composition as a list of
 isolate / intercept`); `DexterousLoader.reconcile/2` diffs by `id` and
 applies the least disruptive operation: a config-only change is handed to the
 component's optional `update/3` callback (paper Section 5.2.1), which may
-absorb the payload or answer `:reload`; anything else rebuilds the entry.
+absorb the payload or answer `:reload`; an isolate-only change reassigns the
+entry's realms in place (paper Algorithm 7, `DexterousLoader.Isolate`),
+moving the bindings the entry owns and notifying exactly the dependents the
+reassignment reaches; anything else rebuilds the entry.
 `DexterousLoader.Group` is an ordinary component whose config is a list of
 child entries, so nested trees stay within the calculus.
 
+Managed realms are deterministic terms: `isolate: %{key => true}` selects a
+local realm `{:local, entry_id, key}` the entry carries wherever it goes, and
+`isolate: %{key => "label"}` selects a global realm `{:global, "label", key}`
+shared by every entry naming it. Realm reassignment draws a fresh delimiter
+tag per changed key on the entry's fiber; tags resolve down the fiber parent
+chain (`Dexterous.Store.delimiter_for/3`), which is how the loader tells a
+binding the entry owns (it travels) from one it merely shares (it stays).
+
 First-cut simplifications versus the paper:
 
-- entries are immutable positions: moving an entry between groups is
-  delete + recreate, so managed-realm reassignment (Algorithm 7) is skipped
+- moving an entry between groups is still delete + recreate: the fiber's
+  identity is not preserved across groups, though its managed realms are
 - HMR is not implemented yet
 
 ## Example

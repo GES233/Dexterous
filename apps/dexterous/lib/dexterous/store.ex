@@ -94,6 +94,51 @@ defmodule Dexterous.Store do
     |> Map.new()
   end
 
+  @doc """
+  Move a binding between realms, preserving its value and provider. Used by
+  the loader's realm reassignment (paper Algorithm 7): a binding the entry
+  owns travels from the old realm to the new one without disappearing.
+  """
+  def move(scope, from_realm, to_realm) do
+    case lookup(scope, from_realm) do
+      {:ok, entry} ->
+        bind(scope, to_realm, entry)
+        unbind(scope, from_realm)
+        :ok
+
+      :error ->
+        :error
+    end
+  end
+
+  @doc """
+  The delimiter tag a fiber resolves for `key` (paper Algorithm 7, `δ_k`):
+  the tag stored on the nearest fiber — itself included — up the parent
+  chain that carries one, or `nil` when none does.
+
+  Delimiter tags are written by the loader when it reassigns an entry's
+  realms and are inherited down the fiber tree, mirroring the paper's
+  prototype-chain inheritance of a delimiter written on the entry's context.
+  Since each reassignment draws a fresh tag, resolving to a given tag proves
+  the fiber was derived within that entry's isolation scope for `key`.
+  """
+  def delimiter_for(scope, fiber_id, key)
+
+  def delimiter_for(_scope, nil, _key), do: nil
+
+  def delimiter_for(scope, fiber_id, key) do
+    case get_fiber(scope, fiber_id) do
+      {:ok, attrs} ->
+        case attrs |> Map.get(:delimiters, %{}) |> Map.get(key) do
+          nil -> delimiter_for(scope, attrs.parent, key)
+          tag -> tag
+        end
+
+      :error ->
+        nil
+    end
+  end
+
   @doc "Keys whose current binding was installed by the given fiber."
   def keys_provided_by(scope, fiber_id) do
     scope

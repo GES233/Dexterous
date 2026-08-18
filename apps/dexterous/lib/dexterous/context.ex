@@ -226,13 +226,26 @@ defmodule Dexterous.Context do
   Propagate binding changes to dependents: any live fiber that injects one of
   `keys` and resolves it to the same realm as this context gets refreshed.
   Returns the ids of the affected fibers, so a caller can wait for them.
+
+  Options:
+
+    * `:affected` — an `fn {fiber_id, fiber_attrs}, key -> boolean()`
+      replacing the default realm test (paper Algorithm 7 uses this to notify
+      exactly the fibers a realm reassignment reaches).
   """
-  def notify(%__MODULE__{} = ctx, keys) do
+  def notify(%__MODULE__{} = ctx, keys, opts \\ []) do
+    affected = Keyword.get(opts, :affected)
+
     ctx.scope
     |> Store.all_fibers()
-    |> Enum.filter(fn {_id, fiber} ->
+    |> Enum.filter(fn {id, fiber} ->
       Enum.any?(keys, fn key ->
-        key in fiber.inject and Map.get(fiber.isolate, key, key) == realm_for(ctx, key)
+        key in fiber.inject and
+          if affected do
+            affected.({id, fiber}, key)
+          else
+            Map.get(fiber.isolate, key, key) == realm_for(ctx, key)
+          end
       end)
     end)
     |> Enum.map(fn {id, fiber} ->
