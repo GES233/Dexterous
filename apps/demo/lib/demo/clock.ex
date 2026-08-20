@@ -10,6 +10,8 @@ defmodule Demo.Clock do
   use Dexterous.Component
 
   defmodule Server do
+    @moduledoc false
+
     use GenServer
 
     def start_link(opts) do

@@ -102,26 +102,25 @@ defmodule DexterousHMR.Watcher.Poll do
 
   defp walk(dir) do
     case File.ls(dir) do
-      {:ok, entries} ->
-        Enum.flat_map(entries, fn entry ->
-          path = Path.join(dir, entry)
+      {:ok, entries} -> Enum.flat_map(entries, &walk_entry(dir, &1))
+      {:error, _} -> []
+    end
+  end
 
-          cond do
-            File.dir?(path) ->
-              walk(path)
+  defp walk_entry(dir, entry) do
+    path = Path.join(dir, entry)
 
-            String.ends_with?(entry, ".ex") or String.ends_with?(entry, ".exs") ->
-              case File.read(path) do
-                {:ok, content} -> [{path, :erlang.md5(content)}]
-                _ -> []
-              end
+    cond do
+      File.dir?(path) ->
+        walk(path)
 
-            true ->
-              []
-          end
-        end)
+      String.ends_with?(entry, ".ex") or String.ends_with?(entry, ".exs") ->
+        case File.read(path) do
+          {:ok, content} -> [{path, :erlang.md5(content)}]
+          _ -> []
+        end
 
-      {:error, _} ->
+      true ->
         []
     end
   end

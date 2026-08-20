@@ -9,7 +9,10 @@ defmodule Demo.Reporter do
   use Dexterous.Component, inject: [:clock]
 
   defmodule Loop do
+    @moduledoc "Inner loop."
+
     use GenServer
+    alias Demo.Clock.Server, as: ClockServer
     require Logger
 
     def start_link(opts) do
@@ -20,7 +23,7 @@ defmodule Demo.Reporter do
 
     @impl true
     def init(opts) do
-      Demo.Clock.Server.subscribe(opts[:clock], self())
+      ClockServer.subscribe(opts[:clock], self())
       {:ok, %{every: opts[:every], target: opts[:target], seen: 0}}
     end
 

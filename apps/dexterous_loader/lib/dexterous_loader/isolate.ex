@@ -88,7 +88,8 @@ defmodule DexterousLoader.Isolate do
         |> Enum.uniq()
         |> Enum.filter(fn key -> Map.get(old_map, key, key) != Map.get(new_map, key, key) end)
 
-      repatch? = delta != [] or (not is_nil(intercept) and intercept != Map.get(attrs, :intercept))
+      repatch? =
+        delta != [] or (not is_nil(intercept) and intercept != Map.get(attrs, :intercept))
 
       if not is_nil(intercept) do
         Store.update_fiber(scope, fiber_id, %{intercept: intercept})
@@ -135,7 +136,7 @@ defmodule DexterousLoader.Isolate do
                 realm = Map.get(fiber.isolate, key, key)
 
                 (realm == s1 or realm == s2) and
-                  (Store.delimiter_for(scope, fid, key) == d1) != (d2 == d1)
+                  Store.delimiter_for(scope, fid, key) == d1 != (d2 == d1)
 
               _ ->
                 false
@@ -161,7 +162,7 @@ defmodule DexterousLoader.Isolate do
     s1 = Map.get(old_map, key, key)
     s2 = Map.get(new_map, key, key)
 
-    Enum.reduce_while([s1, s2], nil, fn realm, acc ->
+    reducer = fn realm, acc ->
       case Store.lookup(scope, realm) do
         {:ok, %{provider: provider}} when not is_nil(provider) ->
           tag = Store.delimiter_for(scope, provider, key)
@@ -171,6 +172,8 @@ defmodule DexterousLoader.Isolate do
         _no_binding_or_root_binding ->
           {:cont, acc}
       end
-    end)
+    end
+
+    Enum.reduce_while([s1, s2], nil, reducer)
   end
 end

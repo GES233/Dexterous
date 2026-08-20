@@ -264,62 +264,81 @@ defmodule DexterousHMR do
         {:error, {:externals_changed, exts}}
 
       {:ok, accepted, refused} ->
-        notify_refused(refused, config)
-
-        if MapSet.size(accepted) == 0 do
-          {:ok,
-           %{
-             changed: MapSet.to_list(changed),
-             accepted: [],
-             refused: refused,
-             reloaded: [],
-             purge_pending: []
-           }}
-        else
-          scopes = loader_scopes(loaders)
-          {per_loader_top, _flat_ids} = stale_by_loader(loaders, accepted)
-
-          all_ids =
-            per_loader_top
-            |> Map.values()
-            |> Enum.flat_map(fn pairs -> Enum.map(pairs, &elem(&1, 0)) end)
-
-          failed_before = failed_fiber_ids(scopes)
-
-          case reload_all(loaders, per_loader_top) do
-            {:error, reason} ->
-              rollback(loaders, per_loader_top, accepted, backup, config,
-                {:reload_failed, reason}
-              )
-
-            :ok ->
-              case wait_settled(scopes, Keyword.get(config, :settle_timeout)) do
-                :ok ->
-                  failed = failed_fiber_ids(scopes) -- failed_before
-
-                  if failed != [] do
-                    rollback(loaders, per_loader_top, accepted, backup, config,
-                      {:fiber_failed, failed}
-                    )
-                  else
-                    {:ok,
-                     %{
-                       changed: MapSet.to_list(changed),
-                       accepted: MapSet.to_list(accepted),
-                       refused: refused,
-                       reloaded: all_ids,
-                       purge_pending: purge(accepted)
-                     }}
-                  end
-
-                {:error, reason} ->
-                  rollback(loaders, per_loader_top, accepted, backup, config,
-                    {:settle_timeout, reason}
-                  )
-              end
-          end
-        end
+        do_swap(loaders, changed, accepted, refused, backup, config)
     end
+  end
+
+  # The transaction proper: reload the stale entries, wait for the cascade to
+  # converge, and either report success or roll back (Algorithm 10).
+  defp do_swap(loaders, changed, accepted, refused, backup, config) do
+    notify_refused(refused, config)
+
+    if MapSet.size(accepted) == 0 do
+      {:ok, noop_report(changed, refused)}
+    else
+      scopes = loader_scopes(loaders)
+      {per_loader_top, _flat_ids} = stale_by_loader(loaders, accepted)
+
+      ctx = %{
+        all_ids: entry_ids(per_loader_top),
+        scopes: scopes,
+        failed_before: failed_fiber_ids(scopes),
+        changed: changed,
+        refused: refused
+      }
+
+      case reload_all(loaders, per_loader_top) do
+        {:error, reason} ->
+          rollback(loaders, per_loader_top, accepted, backup, config, {:reload_failed, reason})
+
+        :ok ->
+          await_convergence(ctx, loaders, per_loader_top, accepted, backup, config)
+      end
+    end
+  end
+
+  # The convergence barrier: a settle timeout or a reloaded fiber ending
+  # :failed rolls the batch back; otherwise report success.
+  defp await_convergence(ctx, loaders, per_loader_top, accepted, backup, config) do
+    case wait_settled(ctx.scopes, Keyword.get(config, :settle_timeout)) do
+      :ok ->
+        failed = failed_fiber_ids(ctx.scopes) -- ctx.failed_before
+
+        if failed != [] do
+          rollback(loaders, per_loader_top, accepted, backup, config, {:fiber_failed, failed})
+        else
+          {:ok, ok_report(ctx.changed, accepted, ctx.refused, ctx.all_ids)}
+        end
+
+      {:error, reason} ->
+        rollback(loaders, per_loader_top, accepted, backup, config, {:settle_timeout, reason})
+    end
+  end
+
+  defp entry_ids(per_loader_top) do
+    per_loader_top
+    |> Map.values()
+    |> Enum.flat_map(fn pairs -> Enum.map(pairs, &elem(&1, 0)) end)
+  end
+
+  defp noop_report(changed, refused) do
+    %{
+      changed: MapSet.to_list(changed),
+      accepted: [],
+      refused: refused,
+      reloaded: [],
+      purge_pending: []
+    }
+  end
+
+  defp ok_report(changed, accepted, refused, all_ids) do
+    %{
+      changed: MapSet.to_list(changed),
+      accepted: MapSet.to_list(accepted),
+      refused: refused,
+      reloaded: all_ids,
+      purge_pending: purge(accepted)
+    }
   end
 
   ## ------------------------------------------------------------------
@@ -422,11 +441,9 @@ defmodule DexterousHMR do
   # `{result, %{added: [modules], removed: [modules]}}` so the loop can keep
   # its purge queue in sync.
   defp run_cycle(state) do
-    try do
       do_cycle(state)
     catch
       kind, reason -> {{:error, {:cycle_exception, kind, reason}}, %{added: [], removed: []}}
-    end
   end
 
   defp do_cycle(state) do
@@ -440,11 +457,17 @@ defmodule DexterousHMR do
         {drained, _remaining} = drain_purge_queue(state.purge_queue)
         backup = take_backup(Keyword.get(config, :watch_dirs))
         before = snapshot(Keyword.get(config, :watch_dirs))
-        compile(config)
-        after_ = snapshot(Keyword.get(config, :watch_dirs))
-        changed = diff(before, after_)
-        result = swap_all(state.loaders, changed, backup, config)
-        {result, %{added: purge_pending_of(result), removed: drained}}
+
+        case compile(config) do
+          {:error, reason} ->
+            {{:error, reason}, %{added: [], removed: []}}
+
+          :ok ->
+            after_ = snapshot(Keyword.get(config, :watch_dirs))
+            changed = diff(before, after_)
+            result = swap_all(state.loaders, changed, backup, config)
+            {result, %{added: purge_pending_of(result), removed: drained}}
+        end
     end
   end
 
@@ -454,7 +477,14 @@ defmodule DexterousHMR do
         :ok
 
       _ ->
-        if Mix.env() == :dev, do: :ok, else: {:error, :not_dev}
+        # Mix is a build-time tool, not a runtime dependency: probe it
+        # dynamically (see compile/1) so dialyzer — which analyzes against
+        # the app's runtime code paths — does not flag the call.
+        if Code.ensure_loaded?(Mix) and Kernel.apply(Mix, :env, []) == :dev do
+          :ok
+        else
+          {:error, :not_dev}
+        end
     end
   end
 
@@ -465,10 +495,17 @@ defmodule DexterousHMR do
         :ok
 
       _ ->
-        Mix.Task.reenable("compile.elixir")
-        Mix.Task.reenable("compile")
-        Mix.Task.run("compile")
-        :ok
+        # Mix ships with the toolchain, not with the app: dispatch
+        # dynamically and fail cleanly when it is genuinely absent (e.g. in
+        # a release), instead of crashing on an undefined function.
+        if Code.ensure_loaded?(Mix) and Code.ensure_loaded?(Mix.Task) do
+          Kernel.apply(Mix.Task, :reenable, ["compile.elixir"])
+          Kernel.apply(Mix.Task, :reenable, ["compile"])
+          Kernel.apply(Mix.Task, :run, ["compile"])
+          :ok
+        else
+          {:error, :mix_not_available}
+        end
     end
   end
 
