@@ -66,6 +66,34 @@ defmodule DexterousLoader do
     GenServer.call(loader, {:move, id, target})
   end
 
+  @doc """
+  Reload one entry's fiber in place: retire the live fiber and respawn it
+  from the same entry record (the HMR primitive of paper Algorithm 10).
+
+  The entry record — component module, config, annotations — is unchanged;
+  only the component's code is expected to have been replaced (dev
+  recompilation), so the fresh fiber runs the new module. Returns `:ok`, or
+  `{:error, :not_found}` when no live fiber carries the entry id (disabled
+  entries have none).
+
+  A caller that enumerated stale entries from the live fibers may treat
+  `:not_found` as benign: the fiber was already replaced by a reloaded
+  ancestor, so its entry was rebuilt with the new code along the way.
+  """
+  def reload_entry(loader, id) do
+    GenServer.call(loader, {:reload_entries, [id]})
+  end
+
+  @doc "Reload several entries in one call; stops at the first failure."
+  def reload_entries(loader, ids) when is_list(ids) do
+    GenServer.call(loader, {:reload_entries, ids})
+  end
+
+  @doc "The scope this loader's composition runs in."
+  def scope(loader) do
+    GenServer.call(loader, :scope)
+  end
+
   @doc "The currently managed top-level fibers: `%{entry_id => %{entry:, pid:}}`."
   def fibers(loader) do
     GenServer.call(loader, :fibers)
@@ -167,8 +195,89 @@ defmodule DexterousLoader do
     end
   end
 
+  def handle_call({:reload_entries, ids}, _from, state) do
+    {result, state} =
+      Enum.reduce_while(ids, {:ok, state}, fn id, {:ok, state} ->
+        case reload_one(state, id) do
+          {:ok, state} -> {:cont, {:ok, state}}
+          {:error, reason} -> {:halt, {{:error, reason}, state}}
+        end
+      end)
+
+    {:reply, result, state}
+  end
+
   def handle_call(:fibers, _from, state) do
     {:reply, state.fibers, state}
+  end
+
+  def handle_call(:scope, _from, state) do
+    {:reply, state.ctx.scope, state}
+  end
+
+  ## Internal: reloads
+
+  # One entry's in-place reload (paper Algorithm 10): retire the live fiber
+  # and respawn it from its own entry record. Top-level entries re-register
+  # their new pid in the loader snapshot, so a later reconcile never holds a
+  # dead pid; nested entries need no loader bookkeeping — the parent group's
+  # next keyed diff adopts the fresh fiber by entry id.
+  defp reload_one(state, id) do
+    scope = state.ctx.scope
+
+    case find_fiber(scope, id) do
+      nil ->
+        {:error, :not_found}
+
+      {_fiber_id, pid, attrs} ->
+        case parent_ctx_for(state, attrs) do
+          {:error, :parent_gone} ->
+            # The parent fiber is gone (retired or reloaded first). Respawning
+            # under the loader's root context would silently change the entry's
+            # inherited realms — refuse instead: the caller decides whether
+            # that is an expected cascade (an ancestor reload) or a real
+            # failure.
+            {:error, :parent_gone}
+
+          {:ok, parent_ctx} ->
+            Fiber.retire(pid)
+            new_pid = spawn_entry(parent_ctx, attrs.entry)
+
+            state =
+              if Map.has_key?(state.fibers, id) do
+                %{state | fibers: Map.put(state.fibers, id, %{entry: attrs.entry, pid: new_pid})}
+              else
+                state
+              end
+
+            {:ok, state}
+        end
+    end
+  end
+
+  # Rebuild the context the entry was spawned on from fiber attributes alone:
+  # a top-level entry spawns on the loader's root context; a nested entry on
+  # the context of its parent fiber — whose realm map and interception
+  # metadata live in the parent's attributes, pure data, no group fiber
+  # involvement needed.
+  defp parent_ctx_for(state, %{parent: nil}), do: {:ok, state.ctx}
+
+  defp parent_ctx_for(state, %{parent: parent_fid}) do
+    scope = state.ctx.scope
+
+    case Store.get_fiber(scope, parent_fid) do
+      {:ok, parent_attrs} ->
+        {:ok,
+         %Context{
+           fiber: parent_fid,
+           scope: scope,
+           isolate: Map.get(parent_attrs, :isolate, %{}),
+           intercept: Map.get(parent_attrs, :intercept, %{})
+         }}
+
+      :error ->
+        {:error, :parent_gone}
+    end
   end
 
   ## Internal: moves

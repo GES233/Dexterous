@@ -129,6 +129,26 @@ defmodule Dexterous.FiberTest do
     assert_receive {:consumer_applied, :b}
   end
 
+  test "a provider whose binding was replaced while unloading is released by the re-satisfied dependent" do
+    ctx = Context.new()
+    {:ok, service_a} = Context.use(ctx, Service, test: self(), value: :a)
+    {:ok, _consumer} = Context.use(ctx, Consumer, test: self())
+    assert_receive {:consumer_applied, :a}
+
+    # The replacement binds the same realm while service_a is still up; the
+    # consumer re-satisfies on it. Retiring service_a must not strand it in
+    # :unloading waiting for a dependent that will never go :inactive.
+    {:ok, service_b} = Context.use(ctx, Service, test: self(), value: :b)
+    assert_receive {:consumer_applied, :b}
+
+    mon = Process.monitor(service_a)
+    Fiber.retire(service_a)
+
+    assert_receive {:service_disposed, :a}
+    assert_receive {:DOWN, ^mon, :process, ^service_a, :normal}
+    assert %{state: :active} = Fiber.status(service_b)
+  end
+
   test "a fiber whose apply raises ends up failed, with partial effects recovered" do
     ctx = Context.new()
     {:ok, bad} = Context.use(ctx, Bad, test: self())

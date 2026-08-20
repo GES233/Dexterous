@@ -1,7 +1,7 @@
 defmodule DexterousLoader.MoveTest do
   use ExUnit.Case, async: false
 
-  alias Dexterous.{Context, Fiber, Store}
+  alias Dexterous.{Context, Store}
   alias DexterousLoader.Entry
 
   defmodule Provider do
@@ -176,7 +176,7 @@ defmodule DexterousLoader.MoveTest do
       ])
 
     {p_fid, p_pid, _} = fiber_of(:p)
-    assert settled(fn -> if {_, _, _} = fiber_of(:p), do: true end)
+    assert settled(fn -> if fiber_of(:p), do: true end)
     assert {^p_fid, ^p_pid, _} = fiber_of(:p)
     refute_received {:provider_disposed, _}
     refute_received {:provider_applied, _}

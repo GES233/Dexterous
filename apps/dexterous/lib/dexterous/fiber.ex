@@ -251,6 +251,15 @@ defmodule Dexterous.Fiber do
         send(waiter, {:fiber_inactive, data.id})
         :keep_state_and_data
 
+      is_map(data.target) and waiter_id not in Map.values(data.target) ->
+        # The waiter is no longer part of our resolved target: a replacement
+        # binding satisfied us (realm rebound while the waiter unloaded), or
+        # the target moved. We will never transition to :inactive on the
+        # waiter's account, so acknowledge immediately instead of stranding
+        # it in :unloading forever.
+        send(waiter, {:fiber_inactive, data.id})
+        :keep_state_and_data
+
       true ->
         {:keep_state, %{data | waiters: [waiter | data.waiters]}}
     end
