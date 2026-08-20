@@ -70,7 +70,7 @@ First-cut simplifications versus the paper:
 - relocating an entry by *editing group configs and reconciling* remains
   delete + recreate; identity-preserving moves go through the explicit
   `DexterousLoader.move/3` API (as does cordis's `EntryTree.update/4`)
-- HMR is not implemented yet
+- HMR has implemented
 
 ## Example
 
