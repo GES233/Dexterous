@@ -159,4 +159,82 @@ defmodule Dexterous.ContextTest do
       Context.effect(ctx, fn _ -> fn -> :ok end end)
     end
   end
+
+  test "provide/3 installs a binding computed from the interception metadata" do
+    ctx = Context.new()
+    :ok = Context.provide(ctx, :fs, fn meta -> Map.get(meta, :mode, :read) end)
+
+    # The empty metadata εₖ applies by default.
+    assert {:ok, :read} = Context.get(ctx, :fs)
+
+    write = Context.intercept(ctx, :fs, %{mode: :write})
+    assert {:ok, :write} = Context.get(write, :fs)
+    # The parent context is untouched.
+    assert {:ok, :read} = Context.get(ctx, :fs)
+  end
+
+  test "metadata merge is right-biased with MapSet union (the ⊕ₖ monoid)" do
+    base = %{mode: :read, paths: MapSet.new(["/a"]), note: 1}
+    overlay = %{mode: :write, paths: MapSet.new(["/b"])}
+
+    assert Context.merge_metadata(base, overlay) == %{
+             mode: :write,
+             paths: MapSet.new(["/a", "/b"]),
+             note: 1
+           }
+
+    parent = Context.intercept(Context.new(), :fs, %{paths: MapSet.new(["/a"])})
+    child = Context.intercept(parent, :fs, %{paths: MapSet.new(["/b"])})
+    assert Context.intercept_for(child, :fs) == %{paths: MapSet.new(["/a", "/b"])}
+  end
+
+  test "effect/3 iterates {inverse, continuation} steps, recovering LIFO" do
+    ctx = Context.new()
+    test_pid = self()
+
+    build = fn build, list ->
+      case list do
+        [] -> :done
+        [step | rest] -> {fn -> send(test_pid, {:disposed, step}) end, fn -> build.(build, rest) end}
+      end
+    end
+
+    {:ok, _last} = Context.effect(ctx, fn _ -> build.(build, [1, 2, 3]) end)
+
+    # Each step pushed its own inverse; recovery unwinds LIFO.
+    Store.take_disposers(node(), :root) |> Enum.each(& &1.())
+    assert_received {:disposed, 3}
+    assert_received {:disposed, 2}
+    assert_received {:disposed, 1}
+  end
+
+  test "an iterator halts at the boundary where the guard turns false" do
+    ctx = Context.new()
+    test_pid = self()
+    allow = fn -> Process.get(:allow_effect, true) end
+
+    build = fn build, list ->
+      case list do
+        [] -> :done
+        [step | rest] -> {fn -> send(test_pid, {:disposed, step}) end, fn -> build.(build, rest) end}
+      end
+    end
+
+    callback = fn _ctx ->
+      Process.put(:allow_effect, false)
+      build.(build, [1, 2])
+    end
+
+    assert_raise Dexterous.HaltedError, fn ->
+      Context.effect(ctx, callback, guard: allow)
+    end
+
+    # The first step was recorded before the halt; the second never ran.
+    [disposer] = Store.take_disposers(node(), :root)
+    disposer.()
+    assert_received {:disposed, 1}
+    refute_received {:disposed, 2}
+  after
+    Process.delete(:allow_effect)
+  end
 end

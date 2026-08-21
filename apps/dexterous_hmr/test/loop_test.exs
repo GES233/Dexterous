@@ -130,6 +130,39 @@ defmodule DexterousHMR.LoopTest do
     assert {:ok, %{reloaded: []}} = DexterousHMR.trigger_compile(opts)
   end
 
+  test "the :watcher option closes the file-change → HMR loop without host wiring" do
+    {mod, _bin, _path} = TestSupport.compile_and_load(:watched_widget, :v1)
+    ctx = Dexterous.root()
+    {:ok, loader} = DexterousLoader.start_link(ctx, [widget_entry(mod)])
+    assert_receive {:applied, ^mod, 1}
+
+    compile_fun = fn ->
+      {^mod, _, _} = TestSupport.compile_and_load(:watched_widget, :v2)
+      :ok
+    end
+
+    # Replace the loop from setup with one owning a watcher.
+    stop_loop()
+
+    {:ok, _pid} =
+      DexterousHMR.start_link(
+        watcher: [dirs: [TestSupport.tmp_dir()], interval: 50, debounce: 50],
+        watch_dirs: [TestSupport.tmp_dir()],
+        compile_fun: compile_fun,
+        settle_timeout: 2_000
+      )
+
+    assert :ok = DexterousHMR.register(loader, [])
+
+    # A file change under the watched dir triggers a cycle on its own.
+    File.write!(
+      Path.join(TestSupport.tmp_dir(), "trigger_#{System.unique_integer([:positive])}.ex"),
+      "# touched\n"
+    )
+
+    assert_receive {:applied, ^mod, 2}, 3_000
+  end
+
   test "unregister removes a loader from the cycle" do
     {mod, _bin, _path} = TestSupport.compile_and_load(:widget, :v1)
     ctx = Dexterous.root()

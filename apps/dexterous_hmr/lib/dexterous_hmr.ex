@@ -54,6 +54,14 @@ defmodule DexterousHMR do
     * `:compile_fun` — overrides the recompile step (tests stub this).
     * `:on_external` / `:on_protected` — host callbacks `(module -> any)`
       fired when a module is refused; default logs.
+
+  Starting the loop accepts an extra `:watcher` option (also read from
+  `config :dexterous_hmr, :watcher`): a keyword list of watcher options
+  (`:dirs`, `:interval`, `:debounce`, `:module` — default
+  `DexterousHMR.Watcher.Poll`). When present, the loop owns a file watcher
+  and every debounced batch of changes triggers a compile cycle — the
+  file-change → recompile → transactional-reload loop is closed without any
+  host wiring. `:watcher` itself is not part of the cycle config.
   """
 
   use GenServer
@@ -82,7 +90,7 @@ defmodule DexterousHMR do
   defmodule State do
     @moduledoc false
     defstruct loaders: %{}, running: false, pending: false, waiter: nil, cycle: nil,
-              purge_queue: MapSet.new(), opts: []
+              purge_queue: MapSet.new(), opts: [], watcher: nil
   end
 
   ## ------------------------------------------------------------------
@@ -347,7 +355,61 @@ defmodule DexterousHMR do
 
   @impl true
   def init(opts) do
-    {:ok, %State{opts: opts}}
+    {:ok, %State{opts: opts, watcher: start_watcher(opts)}}
+  end
+
+  @impl true
+  def terminate(_reason, state) do
+    if is_pid(state.watcher) and Process.alive?(state.watcher) do
+      try do
+        GenServer.stop(state.watcher)
+      catch
+        :exit, _ -> :ok
+      end
+    end
+
+    :ok
+  end
+
+  # Optional file watcher (the `:watcher` start option, or
+  # `config :dexterous_hmr, :watcher`): a keyword list of watcher options
+  # (`:dirs` required, `:interval`, `:debounce`, `:module` — default
+  # `DexterousHMR.Watcher.Poll`). Each debounced batch triggers a compile
+  # cycle, closing the file-change → HMR loop without host wiring.
+  defp start_watcher(opts) do
+    watcher_opts = Keyword.get(opts, :watcher) || Application.get_env(:dexterous_hmr, :watcher)
+
+    if is_list(watcher_opts) do
+      module = Keyword.get(watcher_opts, :module, DexterousHMR.Watcher.Poll)
+      server = self()
+
+      opts =
+        watcher_opts
+        |> Keyword.delete(:module)
+        |> Keyword.put(:on_change, fn _paths -> GenServer.cast(server, :watcher_trigger) end)
+
+      case module.start_link(opts) do
+        {:ok, pid} -> pid
+        _ -> nil
+      end
+    end
+  end
+
+  @impl true
+  def handle_cast(:watcher_trigger, state) do
+    if state.running do
+      {:noreply, %{state | pending: true}}
+    else
+      me = self()
+
+      {pid, _mon} =
+        spawn_monitor(fn ->
+          {result, delta} = run_cycle(state)
+          send(me, {:hmr_cycle_done, self(), result, delta})
+        end)
+
+      {:noreply, %{state | running: true, waiter: nil, cycle: pid}}
+    end
   end
 
   @impl true

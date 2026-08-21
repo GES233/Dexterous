@@ -87,6 +87,15 @@ defmodule Dexterous.Fiber do
   def patch_isolate(pid, isolate, config, intercept),
     do: GenServer.cast(pid, {:patch_isolate, isolate, config, intercept})
 
+  @doc """
+  Replace the fiber's interception metadata in place (paper Section 5.2.1):
+  the metadata is consulted at read time, so no reload is needed. The fiber's
+  own context and its registry attributes are updated; reads already in
+  flight keep the metadata they started with.
+  """
+  def patch_intercept(pid, intercept),
+    do: GenServer.cast(pid, {:patch_intercept, intercept})
+
   @doc "Introspection: `%{id:, state:, target:, committed:, last_error:}`."
   def status(pid), do: :gen_statem.call(pid, :status)
 
@@ -97,7 +106,7 @@ defmodule Dexterous.Fiber do
 
   @impl true
   def init({id, ctx, parent, component, config, attrs}) do
-    inject = component.inject()
+    inject = Dexterous.Component.inject_keys_of(component)
 
     Store.register_fiber(
       ctx.scope,
@@ -107,6 +116,7 @@ defmodule Dexterous.Fiber do
           pid: self(),
           parent: parent,
           inject: inject,
+          provide: Dexterous.Component.provide_of(component),
           isolate: ctx.isolate,
           intercept: ctx.intercept,
           delimiters: %{},
@@ -237,6 +247,12 @@ defmodule Dexterous.Fiber do
         # then finish_unload chains into reload when the target is satisfied.
         start_unload(%{data | force_reload: false})
     end
+  end
+
+  def handle_event(:cast, {:patch_intercept, intercept}, _state, data) do
+    ctx = %{data.ctx | intercept: intercept}
+    Store.update_fiber(ctx.scope, data.id, %{intercept: intercept})
+    {:keep_state, %{data | ctx: ctx}}
   end
 
   def handle_event(:cast, {:notify_inactive, waiter, waiter_id}, state, data) do

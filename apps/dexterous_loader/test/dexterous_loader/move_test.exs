@@ -6,7 +6,7 @@ defmodule DexterousLoader.MoveTest do
 
   defmodule Provider do
     @moduledoc "Provides :shared and reports its lifecycle."
-    use Dexterous.Component
+    use Dexterous.Component, provide: [:shared]
 
     @impl true
     def apply(ctx, config) do
@@ -68,6 +68,51 @@ defmodule DexterousLoader.MoveTest do
     |> Enum.find_value(fn {fiber_id, attrs} ->
       if Map.get(attrs, :entry_id) == entry_id, do: {fiber_id, attrs.pid, attrs}
     end)
+  end
+
+  test "reconcile detects a relocation and moves the fiber instead of rebuilding" do
+    ctx = Dexterous.root()
+
+    tree = fn holder ->
+      [
+        group(:a, if(holder == :a, do: [provider(:p, 1)], else: []), %{}),
+        group(:b, if(holder == :b, do: [provider(:p, 1)], else: []), %{})
+      ]
+    end
+
+    {:ok, loader} = DexterousLoader.start_link(ctx, tree.(:a))
+    assert_receive {:provider_applied, 1}
+    {p_fid, p_pid, _} = fiber_of(:p)
+
+    assert :ok = DexterousLoader.reconcile(loader, tree.(:b))
+
+    # The fiber kept its identity and was re-parented to :b — no rebuild.
+    assert {^p_fid, ^p_pid, attrs} = fiber_of(:p)
+    {b_fid, _, _} = fiber_of(:b)
+    assert attrs.parent == b_fid
+    refute_received {:provider_disposed, _}
+    refute_received {:provider_applied, _}
+
+    # A later reconcile with the same tree is a no-op.
+    assert :ok = DexterousLoader.reconcile(loader, tree.(:b))
+    assert {^p_fid, ^p_pid, _} = fiber_of(:p)
+  end
+
+  test "reconciling a relocation back to the root moves the fiber too" do
+    ctx = Dexterous.root()
+
+    {:ok, loader} =
+      DexterousLoader.start_link(ctx, [group(:a, [provider(:p, 1)], %{})])
+
+    assert_receive {:provider_applied, 1}
+    {p_fid, p_pid, _} = fiber_of(:p)
+
+    assert :ok = DexterousLoader.reconcile(loader, [group(:a, [], %{}), provider(:p, 1)])
+
+    assert {^p_fid, ^p_pid, attrs} = fiber_of(:p)
+    assert attrs.parent == nil
+    refute_received {:provider_disposed, _}
+    refute_received {:provider_applied, _}
   end
 
   test "moving an entry between groups preserves its fiber" do

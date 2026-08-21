@@ -49,6 +49,28 @@ defmodule Dexterous.Store do
     {:reply, :ok, state}
   end
 
+  def handle_call({:update_entry, scope, id, fun}, _from, state) do
+    table = fibers(scope)
+
+    reply =
+      case :ets.lookup(table, id) do
+        [{^id, old}] ->
+          case Map.get(old, :entry) do
+            nil ->
+              :error
+
+            entry ->
+              :ets.insert(table, {id, Map.put(old, :entry, fun.(entry))})
+              :ok
+          end
+
+        [] ->
+          :error
+      end
+
+    {:reply, reply, state}
+  end
+
   ## Bindings
 
   def bind(scope, realm, entry) when is_map(entry) do
@@ -79,6 +101,18 @@ defmodule Dexterous.Store do
   # fibers, the loader and group diffs all write attributes concurrently.
   def update_fiber(scope, id, attrs) when is_map(attrs) do
     GenServer.call(__MODULE__, {:update_fiber, scope, id, attrs})
+  end
+
+  @doc """
+  Apply `fun` to the entry record a fiber carries (the loader's authoritative
+  record of it), serialized through the GenServer. This is the component-to-
+  loader direction of the entry/fiber binding (paper Section 5.2.1): a
+  component that revises its own configuration or disables itself writes the
+  change back to its entry. Returns `:ok`, or `:error` when the fiber carries
+  no entry record.
+  """
+  def update_entry(scope, id, fun) when is_function(fun, 1) do
+    GenServer.call(__MODULE__, {:update_entry, scope, id, fun})
   end
 
   def delete_fiber(scope, id) do

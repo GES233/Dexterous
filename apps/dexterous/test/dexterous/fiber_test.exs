@@ -6,6 +6,7 @@ defmodule Dexterous.FiberTest do
   defmodule Service do
     @moduledoc "Provides the :service coeffect with its configured value."
     def inject, do: []
+    def provide, do: [:service]
 
     def apply(ctx, config) do
       test = config[:test]
@@ -215,9 +216,57 @@ defmodule Dexterous.FiberTest do
     assert BadFetch.inject() == []
     assert Consumer.inject() == [:service]
   end
+
+  defmodule DeclaredReader do
+    @moduledoc "Injects :svc with component-declared metadata and reports the merged layer."
+    use Dexterous.Component, inject: [svc: %{mode: :read, paths: ["/declared"]}]
+
+    @impl true
+    def apply(ctx, config) do
+      value = Context.fetch!(ctx, :svc)
+      send(config[:test], {:declared_read, value})
+      send(config[:test], {:declared_meta, Context.intercept_for(ctx, :svc)})
+    end
+  end
+
+  test "component-declared metadata merges under the context-carried layer" do
+    root = Context.new()
+
+    :ok =
+      Context.provide(root, :svc, fn meta ->
+        %{mode: Map.get(meta, :mode), paths: Map.get(meta, :paths)}
+      end)
+
+    # The orchestrator constrains the component without modifying it (paper
+    # Section 6.3): the context-carried layer wins over the declaration.
+    ctx = Context.intercept(root, :svc, %{mode: :write})
+    {:ok, reader} = Context.use(ctx, DeclaredReader, test: self())
+
+    assert_receive {:declared_read, %{mode: :write, paths: ["/declared"]}}
+    assert_receive {:declared_meta, %{mode: :write, paths: ["/declared"]}}
+    assert %{state: :active} = Fiber.status(reader)
+  end
+
+  test "a fiber may only set keys in its declared provision" do
+    ctx = Context.new()
+    {:ok, service} = Context.use(ctx, Service, test: self(), value: 1)
+    assert_receive {:service_applied, 1}
+
+    service_id = Fiber.status(service).id
+    fiber_ctx = %Context{fiber: service_id, provide: Service.provide()}
+
+    assert_raise Dexterous.UndeclaredProvisionError, fn ->
+      Context.set(fiber_ctx, :not_declared, 1)
+    end
+
+    # The declared key is accepted; the root context stays exempt.
+    assert :ok = Context.set(fiber_ctx, :service, 2)
+    assert :ok = Context.set(ctx, :anything, 3)
+  end
+
   defmodule StepProvider do
     @moduledoc "Provides :step_dep."
-    use Dexterous.Component
+    use Dexterous.Component, provide: [:step_dep]
 
     @impl true
     def apply(ctx, config) do

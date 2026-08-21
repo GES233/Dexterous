@@ -17,7 +17,7 @@ defmodule DexterousLoaderTest do
   end
 
   defmodule Provider do
-    use Dexterous.Component
+    use Dexterous.Component, provide: [:shared]
 
     @impl true
     def apply(ctx, config) do
@@ -53,6 +53,52 @@ defmodule DexterousLoaderTest do
     end
   end
 
+  defmodule Reader do
+    @moduledoc "Injects :shared and reads it on apply and on update."
+    use Dexterous.Component, inject: [:shared]
+
+    @impl true
+    def apply(ctx, config) do
+      send(config[:test], {:reader_applied, Dexterous.Context.fetch!(ctx, :shared)})
+    end
+
+    @impl true
+    def update(ctx, _old, new) do
+      send(new[:test], {:reader_updated, Dexterous.Context.fetch!(ctx, :shared)})
+      :ok
+    end
+  end
+
+  defmodule Fragile do
+    @moduledoc "Fails in apply when configured to."
+    use Dexterous.Component
+
+    @impl true
+    def apply(_ctx, config) do
+      if config[:fail], do: raise("boom")
+      send(config[:test], {:fragile_applied, config[:label]})
+    end
+
+    @impl true
+    def update(_ctx, _old, _new), do: :ok
+  end
+
+  defmodule SelfTuning do
+    @moduledoc "Revises its own config and writes it back to its entry."
+    use Dexterous.Component
+
+    @impl true
+    def apply(ctx, config) do
+      if config[:tune] do
+        Dexterous.Context.write_back(ctx, fn entry ->
+          %{entry | config: entry.config |> Keyword.put(:label, :tuned) |> Keyword.put(:tune, false)}
+        end)
+      end
+
+      send(config[:test], {:tuner_applied, config[:label]})
+    end
+  end
+
   setup do
     for {_, pid, _, _} <- DynamicSupervisor.which_children(Dexterous.FiberSup) do
       DynamicSupervisor.terminate_child(Dexterous.FiberSup, pid)
@@ -60,6 +106,20 @@ defmodule DexterousLoaderTest do
 
     Dexterous.Store.reset(node())
     :ok
+  end
+
+  defp eventually(fun, attempts \\ 50)
+  defp eventually(_fun, 0), do: nil
+
+  defp eventually(fun, attempts) do
+    case fun.() do
+      nil ->
+        Process.sleep(10)
+        eventually(fun, attempts - 1)
+
+      result ->
+        result
+    end
   end
 
   defp probe(id, label, opts \\ []) do
@@ -210,5 +270,100 @@ defmodule DexterousLoaderTest do
 
     {:ok, _loader} = DexterousLoader.start_link(ctx, entries)
     assert_receive {:shared_applied, 7}
+  end
+
+  test "an intercept-only change updates the fiber in place, without a reload" do
+    ctx = Dexterous.root()
+    :ok = Dexterous.Context.set(ctx, :shared, "abc")
+
+    entry = fn transform ->
+      %Entry{
+        id: :r,
+        component: Reader,
+        config: [test: self()],
+        intercept: %{shared: %{transform: transform}}
+      }
+    end
+
+    {:ok, loader} = DexterousLoader.start_link(ctx, [entry.(&String.upcase/1)])
+    assert_receive {:reader_applied, "ABC"}
+    pid = DexterousLoader.fibers(loader)[:r].pid
+
+    :ok = DexterousLoader.reconcile(loader, [entry.(&String.reverse/1)])
+
+    # No reload happened: same fiber, no apply/dispose, and the entry record
+    # and fiber metadata were updated in place.
+    assert DexterousLoader.fibers(loader)[:r].pid == pid
+    refute_received {:reader_applied, _}
+    fiber_id = Dexterous.Fiber.status(pid).id
+    {:ok, attrs} = Dexterous.Store.get_fiber(node(), fiber_id)
+    assert attrs.entry.intercept[:shared].transform.("ab") == "ba"
+    assert attrs.intercept[:shared].transform.("ab") == "ba"
+
+    # A later config change goes to update/3, which reads with the new metadata.
+    :ok =
+      DexterousLoader.reconcile(loader, [
+        %Entry{
+          id: :r,
+          component: Reader,
+          config: [test: self(), v: 2],
+          intercept: %{shared: %{transform: &String.reverse/1}}
+        }
+      ])
+
+    assert_receive {:reader_updated, "cba"}
+    refute_received {:reader_applied, _}
+  end
+
+  test "a config change on a failed fiber rebuilds it instead of dropping the change" do
+    ctx = Dexterous.root()
+    entry = fn label, fail ->
+      %Entry{id: :f, component: Fragile, config: [test: self(), label: label, fail: fail]}
+    end
+
+    {:ok, loader} = DexterousLoader.start_link(ctx, [entry.(1, true)])
+    pid = DexterousLoader.fibers(loader)[:f].pid
+
+    assert eventually(fn ->
+             status = Dexterous.Fiber.status(pid)
+             if status.state == :failed, do: status
+           end)
+
+    :ok = DexterousLoader.reconcile(loader, [entry.(2, false)])
+
+    # The fiber was rebuilt with the new config rather than left failed with
+    # the snapshot silently advanced past it.
+    assert_receive {:fragile_applied, 2}
+    new_pid = DexterousLoader.fibers(loader)[:f].pid
+    assert new_pid != pid
+
+    assert eventually(fn ->
+             status = Dexterous.Fiber.status(new_pid)
+             if status.state == :active, do: status
+           end)
+  end
+
+  test "a component write-back is adopted by reload and reconcile" do
+    ctx = Dexterous.root()
+
+    entry = %Entry{
+      id: :t,
+      component: SelfTuning,
+      config: [test: self(), label: 1, tune: true]
+    }
+
+    {:ok, loader} = DexterousLoader.start_link(ctx, [entry])
+    assert_receive {:tuner_applied, 1}
+
+    # The entry record carries the revision.
+    {_fiber_id, _pid, attrs} =
+      Dexterous.Store.all_fibers(node())
+      |> Enum.find_value(fn {fid, a} -> if a[:entry_id] == :t, do: {fid, a.pid, a} end)
+
+    assert attrs.entry.config[:label] == :tuned
+
+    # An in-place reload respawns from the revised record.
+    :ok = DexterousLoader.reload_entry(loader, :t)
+    assert_receive {:tuner_applied, :tuned}
   end
 end

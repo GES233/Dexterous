@@ -20,7 +20,7 @@ defmodule DexterousLoader.ReloadTest do
 
   defmodule Provider do
     @moduledoc "Provides :shared in the realm the context resolves and reports."
-    use Dexterous.Component
+    use Dexterous.Component, provide: [:shared]
 
     @impl true
     def apply(ctx, config) do

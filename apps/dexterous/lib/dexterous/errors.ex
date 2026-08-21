@@ -20,6 +20,22 @@ defmodule Dexterous.InactiveAccessError do
   def message(%{key: key}), do: "coeffect #{inspect(key)} is declared but not active"
 end
 
+defmodule Dexterous.UndeclaredProvisionError do
+  @moduledoc """
+  Raised when a fiber installs a binding for a key outside its declared
+  provision (paper Definition 43: no key outside `p` is one the component's
+  effect function writes). Declare the key in the component's `provide/0`.
+  The root context is exempt: it answers to the orchestrator, not to a
+  component.
+  """
+  defexception [:key, :provide]
+
+  @impl true
+  def message(%{key: key, provide: provide}) do
+    "coeffect #{inspect(key)} is not in the component's declared provision #{inspect(provide)}"
+  end
+end
+
 defmodule Dexterous.UndeclaredAccessError do
   @moduledoc """
   Raised when a fiber accesses a coeffect that no fiber in its chain declares

@@ -6,7 +6,7 @@ defmodule Demo.Reporter do
   `update/3` absorbs a new `every` without restarting the loop process.
   """
 
-  use Dexterous.Component, inject: [:clock]
+  use Dexterous.Component, inject: [:clock], provide: [{:demo, :loop}]
 
   defmodule Loop do
     @moduledoc "Inner loop."

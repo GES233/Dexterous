@@ -10,18 +10,36 @@ defmodule DexterousLoader do
 
     * a new id is instantiated;
     * a vanished id is retired;
+    * an intercept-only change updates the fiber's metadata in place — it is
+      consulted at read time, so no reload is needed (paper Section 5.2.1);
     * a config-only change is handed to the component's `update/3` when it
-      exports one (paper Section 5.2.1);
-    * an isolate-only change reassigns the entry's realms in place (paper
+      exports one (paper Section 5.2.1); a config change aimed at a
+      non-active fiber rebuilds it instead of dropping the change;
+    * an isolate change reassigns the entry's realms in place (paper
       Algorithm 7, `DexterousLoader.Isolate`);
+    * an id that vanished from one parent and appeared under another is a
+      relocation: the fiber is moved (the `move/3` machinery) rather than
+      deleted and recreated;
     * any other change rebuilds the entry (retired and re-instantiated) —
       rebuilding is sound: the departing fiber's contribution to the state is
       nothing (paper Corollary 62).
 
+  The binding between an entry and its fiber runs in both directions: a
+  component may revise its own record with `Dexterous.Context.write_back/2`
+  (and disable itself with `disabled: true` + `Dexterous.Context.retire_self/1`);
+  the loader adopts such revisions as the reconcile baseline.
+
   Nested composition goes through `DexterousLoader.Group`, an ordinary
   component whose config is a list of child entries; its config changes are
   applied as a keyed diff over child ids, so reconciliation recurses down
-  the tree without rebuilding surviving subtrees.
+  the tree without rebuilding surviving subtrees. `DexterousLoader.Include`
+  grafts a subtree from an external JSON configuration file;
+  `write_entries/2` / `load_entries/1` persist and read back the
+  authoritative record.
+
+  `validate/1` statically checks a configuration's declarations (paper
+  Section 6.5): dependency cycles and duplicate provisions of one key in one
+  realm are reported (via `Logger`) at load and reconcile time.
 
   `move/3` relocates an entry to another group (or the root) while keeping
   its fiber — the equivalent of cordis's `EntryTree.update(id, opts, parent)`.
@@ -30,6 +48,8 @@ defmodule DexterousLoader do
   """
 
   use GenServer
+
+  require Logger
 
   alias Dexterous.{Context, Fiber, Store}
   alias DexterousLoader.{Entry, Group, Isolate}
@@ -40,6 +60,127 @@ defmodule DexterousLoader do
 
   def start_link(%Context{} = ctx, [%Entry{} | _] = entries) do
     GenServer.start_link(__MODULE__, {ctx, entries})
+  end
+
+  @doc """
+  Statically check a configuration's dependency declarations (paper
+  Section 6.5): a dependency cycle is predictable from the declarations
+  alone, so it is reported at load time instead of leaving the involved
+  fibers permanently inactive. Also reported: two enabled entries declaring
+  a provision of the same key in the same realm (the O-Insert single-source
+  discipline — each key has one possible provider).
+
+  Returns `:ok` or `{:error, issues}`, each issue being `{:cycle, path}` or
+  `{:duplicate_provision, key, realm, ids}`. Only the static tree is
+  checked: bindings installed from the root context and subtrees an
+  `Include` loads at runtime are invisible to this check, as are cycles
+  introduced by runtime realm reassignment.
+  """
+  def validate(entries) when is_list(entries) do
+    declarations = entry_declarations(entries, %{})
+
+    provided =
+      for declaration <- declarations,
+          not declaration.disabled,
+          key <- Dexterous.Component.provide_of(declaration.component) do
+        realm = Map.get(declaration.isolate, key, key)
+        {realm, key, declaration.id}
+      end
+
+    duplicates =
+      provided
+      |> Enum.group_by(fn {realm, _key, _id} -> realm end, fn {_realm, key, id} -> {key, id} end)
+      |> Enum.flat_map(fn
+        {_realm, [_single]} -> []
+        {realm, key_ids} -> [{:duplicate_provision, key_ids |> hd() |> elem(0), realm, Enum.map(key_ids, &elem(&1, 1))}]
+      end)
+
+    provider_by_realm = Map.new(provided, fn {realm, _key, id} -> {realm, id} end)
+
+    edges =
+      for declaration <- declarations,
+          not declaration.disabled,
+          key <- Dexterous.Component.inject_keys_of(declaration.component),
+          realm = Map.get(declaration.isolate, key, key),
+          %{^realm => provider_id} <- [provider_by_realm],
+          provider_id != declaration.id,
+          do: {declaration.id, provider_id}
+
+    issues = duplicates ++ Enum.map(find_cycles(edges), &{:cycle, &1})
+    if issues == [], do: :ok, else: {:error, issues}
+  end
+
+  # Every entry in the (possibly nested) tree with its full realm map.
+  defp entry_declarations(entries, parent_isolate) do
+    Enum.flat_map(entries, fn entry ->
+      isolate = Isolate.isolate_map(entry, parent_isolate)
+
+      own = %{
+        id: entry.id,
+        isolate: isolate,
+        component: entry.component,
+        disabled: entry.disabled
+      }
+
+      children = if group?(entry), do: entry_declarations(entry.config, isolate), else: []
+      [own | children]
+    end)
+  end
+
+  # Simple DFS cycle hunt over the id → provider-id edges; cycles are
+  # reported as the id path, deduplicated up to rotation.
+  defp find_cycles(edges) do
+    adjacency = Enum.group_by(edges, &elem(&1, 0), &elem(&1, 1))
+
+    adjacency
+    |> Map.keys()
+    |> Enum.flat_map(fn start -> walk_cycles(start, adjacency, [start], MapSet.new([start])) end)
+    |> Enum.uniq_by(fn path -> Enum.sort(path) end)
+  end
+
+  defp walk_cycles(node, adjacency, path, seen) do
+    Enum.flat_map(Map.get(adjacency, node, []), fn next ->
+      cond do
+        next in path ->
+          # Closed a loop: report the cycle from `next` back to `next`.
+          [path |> Enum.reverse() |> Enum.drop_while(&(&1 != next))]
+
+        MapSet.member?(seen, next) ->
+          []
+
+        true ->
+          walk_cycles(next, adjacency, [next | path], MapSet.put(seen, next))
+      end
+    end)
+  end
+
+  # Report declaration issues at load/reconcile time; the composition still
+  # loads (a cycle's fibers stay inactive, as the calculus prescribes).
+  defp report_issues(entries) do
+    case validate(entries) do
+      :ok ->
+        :ok
+
+      {:error, issues} ->
+        for issue <- issues do
+          Logger.warning("dexterous_loader: " <> format_issue(issue))
+        end
+
+        :ok
+    end
+  end
+
+  defp format_issue({:cycle, path}) do
+    chain = Enum.map_join(path ++ [hd(path)], " -> ", &inspect/1)
+
+    "dependency cycle among entries #{chain}: the involved fibers will stay " <>
+      "permanently inactive (paper Section 6.5)"
+  end
+
+  defp format_issue({:duplicate_provision, key, realm, ids}) do
+    "entries #{Enum.map_join(ids, ", ", &inspect/1)} all declare a provision of " <>
+      "#{inspect(key)} in realm #{inspect(realm)}: each key has one possible provider " <>
+      "(paper O-Insert)"
   end
 
   @doc "Bring the running composition in step with `entries`."
@@ -58,9 +199,9 @@ defmodule DexterousLoader do
   groups is rewritten, so a later `reconcile/2` with the same logical tree
   is a no-op.
 
-  Relocating an entry by editing group configs and reconciling remains
-  delete + recreate; use this function when identity matters. Returns
-  `:ok` or `{:error, reason}`.
+  Relocating an entry by editing the tree and reconciling is detected and
+  routed through this same machinery; use this function for an explicit,
+  programmatic move. Returns `:ok` or `{:error, reason}`.
   """
   def move(loader, id, target) do
     GenServer.call(loader, {:move, id, target})
@@ -94,6 +235,34 @@ defmodule DexterousLoader do
     GenServer.call(loader, :scope)
   end
 
+  @doc """
+  Read a JSON configuration file into a list of entries (the persisted form
+  of the authoritative record, paper Section 5.2.1). The file holds a JSON
+  array of entry maps as produced by `DexterousLoader.Entry.to_map/1`.
+  """
+  def load_entries(path) when is_binary(path) do
+    with {:ok, content} <- File.read(path),
+         {:ok, decoded} <- decode_json(content) do
+      {:ok, Enum.map(decoded, &Entry.from_map/1)}
+    end
+  end
+
+  @doc """
+  Persist a list of entries to a JSON configuration file, in the form
+  `load_entries/1` reads back. See `DexterousLoader.Entry.to_map/1` for the
+  restrictions on what entries can be persisted.
+  """
+  def write_entries(path, entries) when is_binary(path) and is_list(entries) do
+    json = :json.encode(Enum.map(entries, &Entry.to_map/1))
+    File.write(path, IO.iodata_to_binary(json))
+  end
+
+  defp decode_json(content) do
+    {:ok, :json.decode(content)}
+  rescue
+    error -> {:error, {:invalid_json, error}}
+  end
+
   @doc "The currently managed top-level fibers: `%{entry_id => %{entry:, pid:}}`."
   def fibers(loader) do
     GenServer.call(loader, :fibers)
@@ -118,6 +287,16 @@ defmodule DexterousLoader do
   # The per-field reconciliation dispatch for one surviving entry, shared by
   # the top-level loader and by Group's keyed child diff. Returns the entry's
   # (possibly new) fiber pid, or nil when the entry ends up disabled.
+  #
+  # Dispatch (paper Section 5.2.1): an intercept-only change updates the
+  # fiber's metadata in place (it is consulted at read time, so no reload);
+  # a config-only change goes to the component's update/3; an isolate change
+  # reassigns realms (Algorithm 7), absorbing any config/intercept change
+  # alongside; anything else rebuilds. A config change aimed at a non-active
+  # fiber rebuilds instead: a reconfigure cast would be silently dropped and
+  # the snapshot would drift from the running fiber (paper Section 4.3.4:
+  # recovery from failure is orchestrator-driven, and the loader is the
+  # orchestrator). Realm and intercept patches are meaningful in any state.
   def reconcile_child(%Context{} = ctx, %Entry{} = old, %Entry{} = new, pid) do
     cond do
       new.disabled ->
@@ -127,22 +306,67 @@ defmodule DexterousLoader do
       old == new ->
         pid
 
-      config_only_change?(old, new) and updatable?(new.component) ->
+      true ->
+        apply_change(ctx, old, new, pid)
+    end
+  end
+
+  defp apply_change(%Context{} = ctx, %Entry{} = old, %Entry{} = new, pid) do
+    same_core? = old.component == new.component and old.disabled == new.disabled
+    config_same? = old.config == new.config
+
+    cond do
+      not same_core? ->
+        rebuild(ctx, pid, new)
+
+      not config_same? and not active?(pid) ->
+        rebuild(ctx, pid, new)
+
+      true ->
+        apply_cooperative_change(ctx, old, new, pid)
+    end
+  end
+
+  # The fiber is active and its identity, component and disabled flag are
+  # unchanged: realm, config and interception changes can all be absorbed
+  # without a rebuild.
+  defp apply_cooperative_change(%Context{} = ctx, %Entry{} = old, %Entry{} = new, pid) do
+    isolate_same? = old.isolate == new.isolate
+    intercept_same? = old.intercept == new.intercept
+    config_same? = old.config == new.config
+
+    cond do
+      not isolate_same? ->
+        # Paper Algorithm 7: reassign the entry's realms in place; config and
+        # intercept changes ride along (absorbed by the forced reload / the
+        # metadata replacement).
+        opts =
+          if intercept_same?,
+            do: [],
+            else: [intercept: merged_intercept(ctx, new)]
+
+        Isolate.patch(ctx, pid, new, opts)
+        pid
+
+      not config_same? and updatable?(new.component) ->
         # Paper Section 5.2.1: a config change is handed to the component,
         # which decides how to apply the new payload.
+        unless intercept_same?, do: Fiber.patch_intercept(pid, merged_intercept(ctx, new))
         Fiber.reconfigure(pid, new.config)
         put_entry_record(ctx.scope, pid, new)
         pid
 
-      isolate_change?(old, new) ->
-        # Paper Algorithm 7: reassign the entry's realms in place; a config
-        # change rides along, absorbed by the forced reload.
-        Isolate.patch(ctx, pid, new)
+      not config_same? ->
+        rebuild(ctx, pid, new)
+
+      not intercept_same? ->
+        # Interception metadata is consulted at read time: update in place.
+        Fiber.patch_intercept(pid, merged_intercept(ctx, new))
+        put_entry_record(ctx.scope, pid, new)
         pid
 
       true ->
-        Fiber.retire(pid)
-        spawn_entry(ctx, new)
+        pid
     end
   end
 
@@ -150,11 +374,22 @@ defmodule DexterousLoader do
 
   @impl true
   def init({ctx, entries}) do
+    report_issues(entries)
     {:ok, %__MODULE__{ctx: ctx, fibers: instantiate_all(ctx, entries)}}
   end
 
   @impl true
   def handle_call({:reconcile, entries}, _from, state) do
+    report_issues(entries)
+    # Adopt any write-backs (paper Section 5.2.1: a component may revise its
+    # own entry between reconciles) as the baseline the spec diffs against.
+    state = sync_records(state)
+
+    # An id that vanished from one parent and appeared under another is a
+    # relocation: move the fiber (as `move/3` does) rather than letting the
+    # diff delete and recreate it.
+    state = apply_detected_moves(state, entries)
+
     new_by_id = Map.new(entries, &{&1.id, &1})
 
     # Retire entries that vanished.
@@ -281,6 +516,51 @@ defmodule DexterousLoader do
   end
 
   ## Internal: moves
+
+  # Relocations visible between the snapshot tree and the incoming spec: an
+  # entry id whose immediate parent changed while its record stayed the
+  # same. Each detected move goes through the same pipeline as `move/3`.
+  # A relocation whose record also changed falls back to delete + recreate
+  # in the standard diff (the move machinery patches realms from the new
+  # record, so a config change riding along could be lost); so does a move
+  # that does not validate (busy groups, an invalid target).
+  defp apply_detected_moves(state, new_entries) do
+    old_entries = top_entries(state)
+    old_locations = locations(old_entries)
+    new_locations = locations(new_entries)
+
+    moves =
+      for {id, new_location} <- new_locations,
+          old_location = Map.get(old_locations, id),
+          not is_nil(old_location),
+          old_location != new_location,
+          find_fiber(state.ctx.scope, id) != nil,
+          {:ok, old_entry} <- [fetch_entry(old_entries, id)],
+          {:ok, new_entry} <- [fetch_entry(new_entries, id)],
+          old_entry == new_entry,
+          do: {id, old_location, new_location}
+
+    Enum.reduce(moves, state, fn {id, source, target}, state ->
+      with {:ok, entry} <- fetch_entry(new_entries, id),
+           :ok <- validate_target(new_entries, id, source, target),
+           :ok <- await_settled(state, source, target, 500) do
+        do_move(state, entry, source, target)
+      else
+        {:error, _reason} -> state
+      end
+    end)
+  end
+
+  # Map of entry id to its immediate parent (`:root` or `{:group, gid}`),
+  # over the whole (possibly nested) tree.
+  defp locations(entries), do: locations(entries, :root, %{})
+
+  defp locations(entries, parent, acc) do
+    Enum.reduce(entries, acc, fn entry, acc ->
+      acc = Map.put(acc, entry.id, parent)
+      if group?(entry), do: locations(entry.config, {:group, entry.id}, acc), else: acc
+    end)
+  end
 
   defp top_entries(state) do
     Enum.map(state.fibers, fn {_id, %{entry: entry}} -> entry end)
@@ -431,7 +711,7 @@ defmodule DexterousLoader do
         Store.update_fiber(scope, fiber_id, %{parent: parent_fid})
 
         parent_ctx = %{state.ctx | isolate: parent_isolate, intercept: parent_intercept}
-        Isolate.patch(parent_ctx, pid, entry, intercept: merge_intercept(parent_intercept, entry))
+        Isolate.patch(parent_ctx, pid, entry, intercept: merged_intercept(parent_ctx, entry))
     end
 
     # Snapshot rewrite and group convergence: the source group's next diff
@@ -450,15 +730,6 @@ defmodule DexterousLoader do
   defp parent_info(state, {:group, gid}) do
     {fiber_id, _pid, attrs} = find_fiber(state.ctx.scope, gid)
     {fiber_id, Map.get(attrs, :isolate, %{}), Map.get(attrs, :intercept, %{})}
-  end
-
-  # The interception metadata the entry inherits at its new parent: the
-  # parent's map, merged with the entry's own annotations (Context.intercept/3
-  # semantics).
-  defp merge_intercept(parent_intercept, %Entry{intercept: annotations}) do
-    Enum.reduce(annotations, parent_intercept, fn {key, metadata}, acc ->
-      Map.update(acc, key, metadata, &Map.merge(&1, metadata))
-    end)
   end
 
   defp detach(state, entry, :root) do
@@ -527,6 +798,20 @@ defmodule DexterousLoader do
 
   ## Internal
 
+  # Refresh the snapshot's entry records from the live fibers, so component
+  # write-backs (Context.write_back/2) become the reconcile baseline.
+  defp sync_records(state) do
+    fibers =
+      Map.new(state.fibers, fn {id, %{pid: _pid} = fiber} ->
+        case find_fiber(state.ctx.scope, id) do
+          {_fiber_id, _pid, %{entry: %Entry{} = recorded}} -> {id, %{fiber | entry: recorded}}
+          _ -> {id, fiber}
+        end
+      end)
+
+    %{state | fibers: fibers}
+  end
+
   defp instantiate_all(ctx, entries) do
     Map.new(entries, fn entry -> {entry.id, spawn(ctx, entry)} end)
     |> Map.reject(fn {_id, fiber} -> is_nil(fiber) end)
@@ -538,21 +823,25 @@ defmodule DexterousLoader do
     %{entry: entry, pid: spawn_entry(ctx, entry)}
   end
 
-  # Everything but the payload is identical: identity, component, realm and
-  # interception annotations, and the disabled flag.
-  defp config_only_change?(old, new) do
-    old.component == new.component and old.isolate == new.isolate and
-      old.intercept == new.intercept and old.disabled == new.disabled and
-      old.config != new.config
+  # A cooperative change (reconfigure, intercept patch, realm reassignment)
+  # only reaches an active, settled fiber; anything else would drop the cast.
+  defp active?(pid) do
+    Fiber.status(pid).state == :active
+  catch
+    :exit, _ -> false
   end
 
-  # Identity, component, interception annotations and the disabled flag are
-  # all unchanged, but the realm annotations moved: reassign realms in place
-  # instead of rebuilding. A config change alongside is absorbed by the
-  # reload the reassignment forces.
-  defp isolate_change?(old, new) do
-    old.component == new.component and old.intercept == new.intercept and
-      old.disabled == new.disabled and not new.disabled and old.isolate != new.isolate
+  defp rebuild(ctx, pid, entry) do
+    Fiber.retire(pid)
+    spawn_entry(ctx, entry)
+  end
+
+  # The interception metadata an entry runs with: the parent context's,
+  # merged with the entry's own annotations (Context.intercept/3 semantics).
+  defp merged_intercept(%Context{} = ctx, %Entry{intercept: annotations}) do
+    Enum.reduce(annotations, ctx.intercept, fn {key, metadata}, acc ->
+      Map.update(acc, key, metadata, &Map.merge(&1, metadata))
+    end)
   end
 
   defp updatable?(component) do

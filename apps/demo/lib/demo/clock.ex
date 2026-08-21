@@ -7,7 +7,7 @@ defmodule Demo.Clock do
   `update/3` — no restart, subscribers keep their subscription.
   """
 
-  use Dexterous.Component
+  use Dexterous.Component, provide: [:clock]
 
   defmodule Server do
     @moduledoc false

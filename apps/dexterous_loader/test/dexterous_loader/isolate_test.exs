@@ -6,7 +6,7 @@ defmodule DexterousLoader.IsolateTest do
 
   defmodule Provider do
     @moduledoc "Provides the configured key with the configured value."
-    use Dexterous.Component
+    use Dexterous.Component, provide: [:shared]
 
     @impl true
     def apply(ctx, config) do

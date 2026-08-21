@@ -75,34 +75,17 @@ end
 
 Process.sleep(300)
 
-IO.puts("\n== starting the HMR loop and the file watcher ==")
-{:ok, _} = DexterousHMR.start_link()
-:ok = DexterousHMR.register(loader, [])
+IO.puts("\n== starting the HMR loop with its file watcher (no manual wiring) ==")
 
-cycle = fn ->
-  IO.puts("\n== HMR cycle: recompile + diff + transactional swap ==")
-
-  case DexterousHMR.trigger_compile(
-         watch_dirs: [tmp],
-         compile_fun: compile_and_load,
-         settle_timeout: 2_000
-       ) do
-    {:ok, report} ->
-      IO.puts("  accepted modules: #{inspect(report.accepted)}")
-      IO.puts("  reloaded entries: #{inspect(report.reloaded)}")
-
-    other ->
-      IO.puts("  cycle result: #{inspect(other)}")
-  end
-end
-
-{:ok, _watcher} =
-  DexterousHMR.Watcher.Poll.start_link(
-    dirs: [tmp],
-    interval: 300,
-    debounce: 150,
-    on_change: fn _paths -> cycle.() end
+{:ok, _} =
+  DexterousHMR.start_link(
+    watcher: [dirs: [tmp], interval: 300, debounce: 150],
+    watch_dirs: [tmp],
+    compile_fun: compile_and_load,
+    settle_timeout: 2_000
   )
+
+:ok = DexterousHMR.register(loader, [])
 
 IO.puts("\n== simulating an editor save: rewriting clock.ex as v2 ==")
 File.write!(source, version_source.(2))

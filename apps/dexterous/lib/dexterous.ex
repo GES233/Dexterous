@@ -29,6 +29,7 @@ defmodule Dexterous do
   defdelegate get(ctx, key), to: Context
   defdelegate fetch!(ctx, key), to: Context
   defdelegate set(ctx, key, value), to: Context
+  defdelegate provide(ctx, key, fun), to: Context
   defdelegate isolate(ctx, key), to: Context
   defdelegate isolate(ctx, key, realm), to: Context
   defdelegate intercept(ctx, key, metadata), to: Context
