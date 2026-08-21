@@ -54,6 +54,29 @@ defmodule DexterousLoader.IncludeTest do
     assert Enum.at(decoded, 1).isolate == %{shared: "room"}
   end
 
+  test "binary ids and keys round-trip as binaries, atoms as atoms", %{path: path} do
+    entries = [
+      %Entry{
+        id: "binary-id",
+        component: JsonProbe,
+        config: %{"label" => "x"},
+        isolate: %{"binary_key" => "room"},
+        intercept: %{"binary_key" => %{"note" => "hi"}}
+      },
+      %Entry{id: :atom_id, component: JsonProbe, config: %{"label" => "y"}, isolate: %{atom_key: "room"}}
+    ]
+
+    assert :ok = DexterousLoader.write_entries(path, entries)
+    assert {:ok, [first, second]} = DexterousLoader.load_entries(path)
+
+    # No atom/binary confusion either way.
+    assert first.id == "binary-id"
+    assert first.isolate == %{"binary_key" => "room"}
+    assert first.intercept == %{"binary_key" => %{"note" => "hi"}}
+    assert second.id == :atom_id
+    assert second.isolate == %{atom_key: "room"}
+  end
+
   test "Include grafts the file's entries as a nested subtree", %{path: path} do
     :ok = DexterousLoader.write_entries(path, [entry(:c1, "a")])
 

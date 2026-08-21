@@ -31,11 +31,13 @@ defmodule DexterousLoader.Entry do
         }
 
   @doc """
-  Encode an entry as a JSON-safe map with string keys (the on-disk form of
-  the authoritative record, paper Section 5.2.1). Restrictions: `:id`,
-  `:isolate` and `:intercept` keys must be atoms or binaries; `:config` and
-  interception metadata must be JSON-encodable terms (no functions, pids or
-  references — so `:transform` interceptors cannot be persisted).
+  Encode an entry as a JSON-safe map (the on-disk form of the authoritative
+  record, paper Section 5.2.1). Atoms are tagged (`%{"__atom__" => "..."}`)
+  so they round-trip exactly; binaries stay plain JSON strings. `:isolate`
+  and `:intercept` encode as lists of `key`/`value` pairs, since JSON object
+  keys cannot carry the atom tag. Restrictions: `:config` and interception
+  metadata must be JSON-encodable terms (no functions, pids or references —
+  so `:transform` interceptors cannot be persisted).
   """
   def to_map(%__MODULE__{} = entry) do
     %{
@@ -43,16 +45,16 @@ defmodule DexterousLoader.Entry do
       "component" => Atom.to_string(entry.component),
       "config" => entry.config,
       "disabled" => entry.disabled,
-      "isolate" => Map.new(entry.isolate, fn {k, v} -> {encode_term(k), v} end),
-      "intercept" => Map.new(entry.intercept, fn {k, v} -> {encode_term(k), v} end)
+      "isolate" => encode_annotations(entry.isolate),
+      "intercept" => encode_annotations(entry.intercept)
     }
   end
 
   @doc """
-  Decode an entry from its JSON map form (see `to_map/1`). Components are
-  resolved with `String.to_existing_atom/1` — the module must already be
-  loaded. Atom-looking ids and keys decode back to existing atoms, falling
-  back to binaries.
+  Decode an entry from its JSON map form (see `to_map/1`). Atoms — module
+  names, tagged ids and keys — are resolved with `String.to_existing_atom/1`:
+  they must already be loaded (decoding never creates atoms), and an unknown
+  atom raises `ArgumentError`.
   """
   def from_map(%{} = map) do
     %__MODULE__{
@@ -60,17 +62,30 @@ defmodule DexterousLoader.Entry do
       component: Map.fetch!(map, "component") |> String.to_existing_atom(),
       config: Map.get(map, "config"),
       disabled: Map.get(map, "disabled", false),
-      isolate: Map.new(Map.get(map, "isolate", %{}), fn {k, v} -> {decode_term(k), v} end),
-      intercept: Map.new(Map.get(map, "intercept", %{}), fn {k, v} -> {decode_term(k), v} end)
+      isolate: decode_annotations(Map.get(map, "isolate", [])),
+      intercept: decode_annotations(Map.get(map, "intercept", []))
     }
   end
 
-  defp encode_term(term) when is_atom(term), do: Atom.to_string(term)
+  defp encode_annotations(annotations) do
+    Enum.map(annotations, fn {key, value} -> %{"key" => encode_term(key), "value" => value} end)
+  end
+
+  defp decode_annotations(pairs) do
+    Map.new(pairs, fn %{"key" => key, "value" => value} -> {decode_term(key), value} end)
+  end
+
+  defp encode_term(term) when is_atom(term), do: %{"__atom__" => Atom.to_string(term)}
   defp encode_term(term) when is_binary(term), do: term
 
-  defp decode_term(term) when is_binary(term) do
-    String.to_existing_atom(term)
+  defp decode_term(%{"__atom__" => atom}) do
+    String.to_existing_atom(atom)
   rescue
-    ArgumentError -> term
+    ArgumentError ->
+      reraise ArgumentError,
+              [message: "unknown atom #{inspect(atom)} in a persisted entry (atoms are never created on decode)"],
+              __STACKTRACE__
   end
+
+  defp decode_term(term) when is_binary(term), do: term
 end
