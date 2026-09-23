@@ -3,6 +3,9 @@ defmodule Demo.Clock do
   Provides the `:clock` coeffect: a pid of a ticking clock server that
   subscribers receive `{:tick, n}` messages from.
 
+  Every tick number first passes through the `:"demo/tick"` waterfall event,
+  so listeners (see `Demo.Guard`) may rewrite it before subscribers see it.
+
   The interval is config-driven and can be changed in place through
   `update/3` — no restart, subscribers keep their subscription.
   """
@@ -24,7 +27,7 @@ defmodule Demo.Clock do
     @impl true
     def init(opts) do
       schedule(opts[:interval])
-      {:ok, %{interval: opts[:interval], subs: MapSet.new(), n: 0}}
+      {:ok, %{interval: opts[:interval], on_tick: opts[:on_tick], subs: MapSet.new(), n: 0}}
     end
 
     @impl true
@@ -38,7 +41,8 @@ defmodule Demo.Clock do
 
     @impl true
     def handle_info(:tick, state) do
-      for sub <- state.subs, do: send(sub, {:tick, state.n})
+      n = state.on_tick.(state.n)
+      for sub <- state.subs, do: send(sub, {:tick, n})
       schedule(state.interval)
       {:noreply, %{state | n: state.n + 1}}
     end
@@ -48,7 +52,12 @@ defmodule Demo.Clock do
 
   @impl true
   def apply(ctx, config) do
-    {:ok, clock} = Server.start_link(interval: config[:interval])
+    {:ok, clock} =
+      Server.start_link(
+        interval: config[:interval],
+        on_tick: fn n -> Dexterous.Context.waterfall(ctx, :"demo/tick", n) end
+      )
+
     Dexterous.Context.track(ctx, clock)
     Dexterous.Context.set(ctx, :clock, clock)
   end

@@ -34,13 +34,13 @@ defmodule Dexterous.Context do
   recovers the environment in LIFO order.
   """
 
-  alias Dexterous.Store
+  alias Dexterous.{Events, Store}
 
   defstruct fiber: nil, isolate: %{}, intercept: %{}, scope: node(), guard: nil, provide: []
   @type key :: term()
   @type realm :: term()
   @type scope :: term()
-  @type guard :: (() -> boolean())
+  @type guard :: (-> boolean())
   @type t :: %__MODULE__{
           fiber: term() | nil,
           isolate: %{key() => realm()},
@@ -335,6 +335,51 @@ defmodule Dexterous.Context do
     end)
   end
 
+  ## Typed events
+
+  @doc """
+  Register `listener` for `event` as a revertible effect: the listener is
+  appended after the existing ones and removed automatically when the owning
+  fiber unloads (or when the returned disposer is invoked). See
+  `Dexterous.Events` for the listener shapes and dispatch semantics.
+  """
+  def on(%__MODULE__{} = ctx, event, listener) when is_function(listener) do
+    effect(ctx, fn _ctx ->
+      {:ok, key} = Store.add_listener(ctx.scope, event, listener)
+
+      fn ->
+        Store.remove_listener(ctx.scope, key)
+      end
+    end)
+  end
+
+  @doc "Emit `event` to its listeners for side effects. Returns `:ok`."
+  def emit(%__MODULE__{scope: scope}, event, payload \\ nil) do
+    scope |> Store.listeners_for(event) |> Events.emit(payload)
+  end
+
+  @doc "Emit `event` to its listeners in order, collecting their results."
+  def serial(%__MODULE__{scope: scope}, event, payload \\ nil) do
+    scope |> Store.listeners_for(event) |> Events.serial(payload)
+  end
+
+  @doc """
+  Run `event`'s listeners as a middleware chain over `payload`: arity-2
+  listeners delegate with `next.(new_payload)` or short-circuit by declining;
+  arity-1 listeners transform implicitly. Returns the final payload.
+  """
+  def waterfall(%__MODULE__{scope: scope}, event, payload) do
+    scope |> Store.listeners_for(event) |> Events.waterfall(payload)
+  end
+
+  @doc """
+  Run `event`'s listeners in order until one returns a non-`nil` result.
+  Returns that result, or `nil` when every listener declined.
+  """
+  def bail(%__MODULE__{scope: scope}, event, payload \\ nil) do
+    scope |> Store.listeners_for(event) |> Events.bail(payload)
+  end
+
   ## Component instantiation
 
   @doc """
@@ -353,8 +398,8 @@ defmodule Dexterous.Context do
   """
   def write_back(%__MODULE__{fiber: nil}, _fun), do: :error
 
-  def write_back(%__MODULE__{} = ctx, fun) when is_function(fun, 1) do
-    Store.update_entry(ctx.scope, ctx.fiber, fun)
+  def write_back(%__MODULE__{scope: scope, fiber: fiber}, fun) when is_function(fun, 1) do
+    Store.update_entry(scope, fiber, fun)
   end
 
   @doc """
@@ -363,8 +408,8 @@ defmodule Dexterous.Context do
   """
   def retire_self(%__MODULE__{fiber: nil}), do: :error
 
-  def retire_self(%__MODULE__{} = ctx) do
-    case Store.get_fiber(ctx.scope, ctx.fiber) do
+  def retire_self(%__MODULE__{scope: scope, fiber: fiber}) do
+    case Store.get_fiber(scope, fiber) do
       {:ok, %{pid: pid}} -> Dexterous.Fiber.retire(pid)
       :error -> :error
     end
@@ -402,6 +447,7 @@ defmodule Dexterous.Context do
         provide: Dexterous.Component.provide_of(component),
         intercept: intercept
     }
+
     attrs = Keyword.get(opts, :attrs, %{})
 
     {:ok, pid} =
@@ -433,7 +479,8 @@ defmodule Dexterous.Context do
 
   defp apply_intercept(value, nil), do: value
 
-  defp apply_intercept(value, %{transform: transform} = _metadata) when is_function(transform, 1) do
+  defp apply_intercept(value, %{transform: transform} = _metadata)
+       when is_function(transform, 1) do
     transform.(value)
   end
 

@@ -36,6 +36,12 @@ Composability](https://github.com/cordiverse/paper)* on the BEAM:
   function of the merged metadata (`ℳₖ → 𝒱ₖ`), which is how metadata-mediated
   access control (paper Section 6.3) is expressed; a plain `:transform`
   function is applied to plain bindings at read time.
+- **Typed events**: `Context.on/3` registers a listener as a revertible
+  effect, so it unwinds with the owning fiber; `Context.emit/3`,
+  `serial/3`, `waterfall/3` and `bail/3` dispatch to the scope's listeners
+  in registration order. `waterfall/3` is a middleware chain whose arity-2
+  listeners delegate with `next.()` or short-circuit by declining — the
+  seam interception and approval policies hook into.
 - **Fibers**: each component instantiation is a `:gen_statem` process running
   the inertial lifecycle `inactive | loading | active | unloading | failed`
   (paper Algorithm 5). Unloading a provider drains its dependents before its
@@ -54,6 +60,7 @@ Composability](https://github.com/cordiverse/paper)* on the BEAM:
 
 - Context -> `Dexterous.Context`(immutable struct)+ shared store in ETS(`Dexterous.Store`)
 - State Machine -> `:gen_statem`(`Dexterous.Fiber`)
+- Event dispatch -> `Dexterous.Events`(pure functions over the scope's listener table)
 - Component DSL -> `use Dexterous.Component, inject: [...], provide: [...]`
 
 ## Loader (`dexterous_loader`)

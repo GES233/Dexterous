@@ -149,7 +149,9 @@ defmodule DexterousLoader.MoveTest do
     {:ok, loader} =
       DexterousLoader.start_link(ctx, [
         group(:a, [provider(:p, 1)], %{}),
-        group(:b, [%Entry{id: :c, component: Consumer, config: [test: self()]}], %{shared: "roomB"})
+        group(:b, [%Entry{id: :c, component: Consumer, config: [test: self()]}], %{
+          shared: "roomB"
+        })
       ])
 
     # The consumer resolves :shared in roomB, where nothing is provided yet.
@@ -275,7 +277,10 @@ defmodule DexterousLoader.MoveTest do
       ])
 
     assert settled(fn -> if fiber_of(:sub), do: true end)
-    assert {:error, :cannot_move_into_descendant} = DexterousLoader.move(loader, :a, {:group, :sub})
+
+    assert {:error, :cannot_move_into_descendant} =
+             DexterousLoader.move(loader, :a, {:group, :sub})
+
     assert {:error, :already_there} = DexterousLoader.move(loader, :p, {:group, :a})
   end
 end

@@ -284,9 +284,11 @@ defmodule Dexterous.FiberTest do
       Dexterous.Context.effect(ctx, fn _ -> fn -> send(test, :step1_disposed) end end)
       send(test, {:apply_pid, self()})
       send(test, :step1)
+
       receive do
         :continue -> :ok
       end
+
       Dexterous.Context.effect(ctx, fn _ -> fn -> send(test, :step2_disposed) end end)
       send(test, :step2)
     end

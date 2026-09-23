@@ -91,7 +91,10 @@ defmodule DexterousLoaderTest do
     def apply(ctx, config) do
       if config[:tune] do
         Dexterous.Context.write_back(ctx, fn entry ->
-          %{entry | config: entry.config |> Keyword.put(:label, :tuned) |> Keyword.put(:tune, false)}
+          %{
+            entry
+            | config: entry.config |> Keyword.put(:label, :tuned) |> Keyword.put(:tune, false)
+          }
         end)
       end
 
@@ -317,6 +320,7 @@ defmodule DexterousLoaderTest do
 
   test "a config change on a failed fiber rebuilds it instead of dropping the change" do
     ctx = Dexterous.root()
+
     entry = fn label, fail ->
       %Entry{id: :f, component: Fragile, config: [test: self(), label: label, fail: fail]}
     end

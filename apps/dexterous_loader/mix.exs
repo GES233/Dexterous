@@ -59,7 +59,7 @@ defmodule DexterousLoader.MixProject do
     if @in_umbrella do
       [{:dexterous, in_umbrella: true}]
     else
-      [{:dexterous, "~> 0.1"}]
+      [{:dexterous, github: "GES233/Dexterous", sparse: "apps/dexterous"}]
     end
   end
 end

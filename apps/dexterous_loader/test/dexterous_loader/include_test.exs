@@ -24,7 +24,9 @@ defmodule DexterousLoader.IncludeTest do
 
     Store.reset(node())
 
-    path = Path.join(System.tmp_dir!(), "dexterous_include_#{System.unique_integer([:positive])}.json")
+    path =
+      Path.join(System.tmp_dir!(), "dexterous_include_#{System.unique_integer([:positive])}.json")
+
     on_exit(fn -> File.rm(path) end)
 
     {:ok, path: path}
@@ -63,7 +65,12 @@ defmodule DexterousLoader.IncludeTest do
         isolate: %{"binary_key" => "room"},
         intercept: %{"binary_key" => %{"note" => "hi"}}
       },
-      %Entry{id: :atom_id, component: JsonProbe, config: %{"label" => "y"}, isolate: %{atom_key: "room"}}
+      %Entry{
+        id: :atom_id,
+        component: JsonProbe,
+        config: %{"label" => "y"},
+        isolate: %{atom_key: "room"}
+      }
     ]
 
     assert :ok = DexterousLoader.write_entries(path, entries)
@@ -81,7 +88,11 @@ defmodule DexterousLoader.IncludeTest do
     :ok = DexterousLoader.write_entries(path, [entry(:c1, "a")])
 
     ctx = Dexterous.root()
-    {:ok, loader} = DexterousLoader.start_link(ctx, [%Entry{id: :inc, component: DexterousLoader.Include, config: path}])
+
+    {:ok, loader} =
+      DexterousLoader.start_link(ctx, [
+        %Entry{id: :inc, component: DexterousLoader.Include, config: path}
+      ])
 
     assert_receive {:json_probe_applied, "a"}
 
@@ -99,7 +110,9 @@ defmodule DexterousLoader.IncludeTest do
     missing = path <> ".missing"
 
     {:ok, loader} =
-      DexterousLoader.start_link(ctx, [%Entry{id: :inc, component: DexterousLoader.Include, config: missing}])
+      DexterousLoader.start_link(ctx, [
+        %Entry{id: :inc, component: DexterousLoader.Include, config: missing}
+      ])
 
     pid = DexterousLoader.fibers(loader)[:inc].pid
 

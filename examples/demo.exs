@@ -29,4 +29,19 @@ IO.puts("\n== 5. a fresh clock (new provider): the reporter resubscribes ==")
 :ok = DexterousLoader.reconcile(loader, [reporter.(1), clock.(100)])
 Process.sleep(600)
 
+IO.puts("\n== 6. a guard joins: it intercepts the tick event, numbers shift by +100 ==")
+
+:ok =
+  DexterousLoader.reconcile(loader, [
+    reporter.(1),
+    clock.(100),
+    %Entry{id: :guard, component: Demo.Guard, config: [offset: 100]}
+  ])
+
+Process.sleep(600)
+
+IO.puts("\n== 7. guard removed: its listener unwinds with it, plain numbers again ==")
+:ok = DexterousLoader.reconcile(loader, [reporter.(1), clock.(100)])
+Process.sleep(400)
+
 IO.puts("\ndone.")

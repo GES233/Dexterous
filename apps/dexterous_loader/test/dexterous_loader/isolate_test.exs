@@ -74,10 +74,11 @@ defmodule DexterousLoader.IsolateTest do
     pid_p = DexterousLoader.fibers(loader)[:p].pid
     pid_c = DexterousLoader.fibers(loader)[:c].pid
 
-    :ok = DexterousLoader.reconcile(loader, [
-      provider(:p, :shared, 1, %{shared: "room2"}),
-      consumer(:c, %{shared: "room1"})
-    ])
+    :ok =
+      DexterousLoader.reconcile(loader, [
+        provider(:p, :shared, 1, %{shared: "room2"}),
+        consumer(:c, %{shared: "room1"})
+      ])
 
     # The entry is patched in place: same fiber, and its binding traveled to
     # the new realm without going away in between (the move is synchronous
@@ -107,17 +108,19 @@ defmodule DexterousLoader.IsolateTest do
     assert_receive {:consumer_applied, 1}
     pid_c = DexterousLoader.fibers(loader)[:c].pid
 
-    :ok = DexterousLoader.reconcile(loader, [
-      provider(:p, :shared, 1, %{shared: "room2"}),
-      consumer(:c, %{shared: "room1"})
-    ])
+    :ok =
+      DexterousLoader.reconcile(loader, [
+        provider(:p, :shared, 1, %{shared: "room2"}),
+        consumer(:c, %{shared: "room1"})
+      ])
 
     assert_receive {:consumer_disposed, 1}, 500
 
-    :ok = DexterousLoader.reconcile(loader, [
-      provider(:p, :shared, 1, %{shared: "room2"}),
-      consumer(:c, %{shared: "room2"})
-    ])
+    :ok =
+      DexterousLoader.reconcile(loader, [
+        provider(:p, :shared, 1, %{shared: "room2"}),
+        consumer(:c, %{shared: "room2"})
+      ])
 
     # The consumer reloads in place against the new realm and sees the value.
     assert_receive {:consumer_applied, 1}, 500

@@ -65,8 +65,8 @@ defmodule DexterousHMR.MixProject do
       ]
     else
       [
-        {:dexterous, "~> 0.1"},
-        {:dexterous_loader, "~> 0.1"}
+        {:dexterous, github: "GES233/Dexterous", sparse: "apps/dexterous"},
+        {:dexterous_loader, github: "GES233/Dexterous", sparse: "apps/dexterous_loader"}
       ]
     end
   end

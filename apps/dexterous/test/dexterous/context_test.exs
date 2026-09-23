@@ -113,6 +113,7 @@ defmodule Dexterous.ContextTest do
 
     assert :ok = disposer.()
   end
+
   test "get/2 applies an intercept :transform to the stored value" do
     ctx = Context.new() |> Context.intercept(:theme, %{transform: &String.upcase/1})
     :ok = Context.set(ctx, :theme, "dark")
@@ -135,7 +136,9 @@ defmodule Dexterous.ContextTest do
     test_pid = self()
 
     allow = fn -> Process.get(:allow_effect, true) end
-    {:ok, _} = Context.effect(ctx, fn _ -> fn -> send(test_pid, :a_disposed) end end, guard: allow)
+
+    {:ok, _} =
+      Context.effect(ctx, fn _ -> fn -> send(test_pid, :a_disposed) end end, guard: allow)
 
     Process.put(:allow_effect, false)
 
@@ -194,8 +197,11 @@ defmodule Dexterous.ContextTest do
 
     build = fn build, list ->
       case list do
-        [] -> :done
-        [step | rest] -> {fn -> send(test_pid, {:disposed, step}) end, fn -> build.(build, rest) end}
+        [] ->
+          :done
+
+        [step | rest] ->
+          {fn -> send(test_pid, {:disposed, step}) end, fn -> build.(build, rest) end}
       end
     end
 
@@ -215,8 +221,11 @@ defmodule Dexterous.ContextTest do
 
     build = fn build, list ->
       case list do
-        [] -> :done
-        [step | rest] -> {fn -> send(test_pid, {:disposed, step}) end, fn -> build.(build, rest) end}
+        [] ->
+          :done
+
+        [step | rest] ->
+          {fn -> send(test_pid, {:disposed, step}) end, fn -> build.(build, rest) end}
       end
     end
 

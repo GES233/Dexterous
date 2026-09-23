@@ -76,12 +76,15 @@ defmodule DexterousLoader.GroupTest do
     # Neither the group fiber nor the surviving child's fiber was rebuilt.
     # The retired c2 fiber lingers in the store until its unload completes, so
     # poll until the registry hands back a fresh pid.
-    assert eventually(fn ->
-             case fiber_of(:c2) do
-               {_fid, pid, _attrs} when pid != c2_pid -> true
-               _ -> nil
-             end
-           end, 50)
+    assert eventually(
+             fn ->
+               case fiber_of(:c2) do
+                 {_fid, pid, _attrs} when pid != c2_pid -> true
+                 _ -> nil
+               end
+             end,
+             50
+           )
 
     assert {_, ^group_pid, _} = fiber_of(:g)
     assert {_, ^c1_pid, _} = fiber_of(:c1)

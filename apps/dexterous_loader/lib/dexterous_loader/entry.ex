@@ -83,7 +83,10 @@ defmodule DexterousLoader.Entry do
   rescue
     ArgumentError ->
       reraise ArgumentError,
-              [message: "unknown atom #{inspect(atom)} in a persisted entry (atoms are never created on decode)"],
+              [
+                message:
+                  "unknown atom #{inspect(atom)} in a persisted entry (atoms are never created on decode)"
+              ],
               __STACKTRACE__
   end
 

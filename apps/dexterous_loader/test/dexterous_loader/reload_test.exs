@@ -101,12 +101,15 @@ defmodule DexterousLoader.ReloadTest do
     assert_receive {:probe_applied, :a, 1}
 
     # A fresh fiber, and the loader no longer holds the dead pid.
-    assert eventually(fn ->
-             case fiber_of(:a) do
-               {fid, pid, _} when pid != a_pid and fid != a_fid -> true
-               _ -> nil
-             end
-           end, 50)
+    assert eventually(
+             fn ->
+               case fiber_of(:a) do
+                 {fid, pid, _} when pid != a_pid and fid != a_fid -> true
+                 _ -> nil
+               end
+             end,
+             50
+           )
 
     {_new_fid, new_pid, _} = fiber_of(:a)
     assert %{pid: ^new_pid} = DexterousLoader.fibers(loader)[:a]
@@ -132,12 +135,15 @@ defmodule DexterousLoader.ReloadTest do
     assert_receive {:probe_applied, :c2, 1}
 
     # The group fiber is untouched; only c2 was rebuilt, re-parented to it.
-    assert eventually(fn ->
-             case fiber_of(:c2) do
-               {_fid, pid, attrs} when pid != c2_pid -> if attrs.parent == g_fid, do: true
-               _ -> nil
-             end
-           end, 50)
+    assert eventually(
+             fn ->
+               case fiber_of(:c2) do
+                 {_fid, pid, attrs} when pid != c2_pid -> if attrs.parent == g_fid, do: true
+                 _ -> nil
+               end
+             end,
+             50
+           )
 
     assert {_, ^g_pid, _} = fiber_of(:g)
     assert {^c1_fid, ^c1_pid, _} = fiber_of(:c1)
@@ -169,18 +175,21 @@ defmodule DexterousLoader.ReloadTest do
 
     # The new fiber owns the binding in the very same realm, and the consumer
     # in the room comes back alive on the refreshed binding.
-    assert eventually(fn ->
-             case fiber_of(:p) do
-               {fid, pid, _} when pid != p_pid ->
-                 case Store.lookup(node(), room) do
-                   {:ok, %{provider: ^fid, value: 1}} -> true
-                   _ -> nil
-                 end
+    assert eventually(
+             fn ->
+               case fiber_of(:p) do
+                 {fid, pid, _} when pid != p_pid ->
+                   case Store.lookup(node(), room) do
+                     {:ok, %{provider: ^fid, value: 1}} -> true
+                     _ -> nil
+                   end
 
-               _ ->
-                 nil
-             end
-           end, 50)
+                 _ ->
+                   nil
+               end
+             end,
+             50
+           )
 
     assert_receive {:consumer_applied, 1}, 500
   end
@@ -203,12 +212,15 @@ defmodule DexterousLoader.ReloadTest do
     # keyed diff adopts the fresh c2 by entry id (old == new).
     :ok = DexterousLoader.reconcile(loader, [group(children)])
 
-    assert eventually(fn ->
-             case fiber_of(:c2) do
-               {_, pid, _} when pid != c2_pid -> true
-               _ -> nil
-             end
-           end, 50)
+    assert eventually(
+             fn ->
+               case fiber_of(:c2) do
+                 {_, pid, _} when pid != c2_pid -> true
+                 _ -> nil
+               end
+             end,
+             50
+           )
 
     refute_received {:probe_disposed, :c1, _}
     refute_received {:probe_applied, :c1, _}
@@ -235,12 +247,15 @@ defmodule DexterousLoader.ReloadTest do
     assert_receive {:probe_applied, :a, 1}
     assert_receive {:probe_applied, :b, 1}
 
-    assert eventually(fn ->
-             case {fiber_of(:a), fiber_of(:b)} do
-               {{_, pa, _}, {_, pb, _}} when pa != a_pid and pb != b_pid -> true
-               _ -> nil
-             end
-           end, 50)
+    assert eventually(
+             fn ->
+               case {fiber_of(:a), fiber_of(:b)} do
+                 {{_, pa, _}, {_, pb, _}} when pa != a_pid and pb != b_pid -> true
+                 _ -> nil
+               end
+             end,
+             50
+           )
   end
 
   test "reload of an unknown entry id is refused" do

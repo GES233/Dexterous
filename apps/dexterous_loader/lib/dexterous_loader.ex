@@ -91,8 +91,14 @@ defmodule DexterousLoader do
       provided
       |> Enum.group_by(fn {realm, _key, _id} -> realm end, fn {_realm, key, id} -> {key, id} end)
       |> Enum.flat_map(fn
-        {_realm, [_single]} -> []
-        {realm, key_ids} -> [{:duplicate_provision, key_ids |> hd() |> elem(0), realm, Enum.map(key_ids, &elem(&1, 1))}]
+        {_realm, [_single]} ->
+          []
+
+        {realm, key_ids} ->
+          [
+            {:duplicate_provision, key_ids |> hd() |> elem(0), realm,
+             Enum.map(key_ids, &elem(&1, 1))}
+          ]
       end)
 
     provider_by_realm = Map.new(provided, fn {realm, _key, id} -> {realm, id} end)

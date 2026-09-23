@@ -2,13 +2,15 @@ defmodule Dexterous.Store do
   @moduledoc """
   Owns the ETS tables that back the context paradigm.
 
-  Tables are partitioned by *scope*: each scope gets its own triple of
+  Tables are partitioned by *scope*: each scope gets its own set of
 
     * `store` — coeffect bindings, `{realm, entry}` where entry is
       `%{key:, value:, provider:}` (provider is a fiber id or `nil` for root)
     * `fibers` — live fibers, `{fiber_id, attrs}`
     * `disposers` — per-owner stacks of revertible-effect inverses (LIFO),
       keyed by fiber id or `:root`
+    * `listeners` — typed-event listeners, keyed by `{event, seq}` in an
+      `:ordered_set` so dispatch observes registration order
 
   The default scope is the node name (`node/0`); `Dexterous.root/1` starts an
   independent composition root under an explicit scope name, so several
@@ -216,11 +218,37 @@ defmodule Dexterous.Store do
 
   @doc "Drop every table of a scope. Intended for tests."
   def reset(scope) do
-    {store, fibers, disposers} = tids(scope)
+    {store, fibers, disposers, listeners} = tids(scope)
     :ets.delete_all_objects(store)
     :ets.delete_all_objects(fibers)
     :ets.delete_all_objects(disposers)
+    :ets.delete_all_objects(listeners)
     :ok
+  end
+
+  ## Event listeners
+
+  @doc """
+  Register `fun` as a listener for `event`, appended after the existing ones.
+  Returns `{:ok, key}`; the key is the handle for `remove_listener/2`.
+  """
+  def add_listener(scope, event, fun) when is_function(fun) do
+    key = {event, System.unique_integer([:monotonic])}
+    :ets.insert(listeners(scope), {key, fun})
+    {:ok, key}
+  end
+
+  def remove_listener(scope, key) do
+    :ets.delete(listeners(scope), key)
+    :ok
+  end
+
+  @doc "The listeners of `event`, in registration order."
+  def listeners_for(scope, event) do
+    scope
+    |> listeners()
+    |> :ets.match({{event, :_}, :"$1"})
+    |> List.flatten()
   end
 
   ## Internal
@@ -228,6 +256,7 @@ defmodule Dexterous.Store do
   defp store(scope), do: elem(tids(scope), 0)
   defp fibers(scope), do: elem(tids(scope), 1)
   defp disposers(scope), do: elem(tids(scope), 2)
+  defp listeners(scope), do: elem(tids(scope), 3)
 
   defp tids(scope) do
     case :ets.lookup(@scopes, scope) do
@@ -245,7 +274,8 @@ defmodule Dexterous.Store do
         tids = {
           :ets.new(:store, [:public, :set]),
           :ets.new(:fibers, [:public, :set]),
-          :ets.new(:disposers, [:public, :set])
+          :ets.new(:disposers, [:public, :set]),
+          :ets.new(:listeners, [:public, :ordered_set])
         }
 
         :ets.insert(@scopes, {scope, tids})
