@@ -524,11 +524,16 @@ defmodule DexterousHMR do
           {:error, reason} ->
             {{:error, reason}, %{added: [], removed: []}}
 
-          :ok ->
+          {:ok, compile_status} ->
+            # Mix compile writes beams but does not load them: load the beams
+            # of loaded-and-changed modules ourselves, or the md5 diff below
+            # can never see a change. (Fresh modules stay untouched: the code
+            # path autoloads them on first call, and the report says so.)
+            load_changed_beams(Keyword.get(config, :watch_dirs))
             after_ = snapshot(Keyword.get(config, :watch_dirs))
             changed = diff(before, after_)
             result = swap_all(state.loaders, changed, backup, config)
-            {result, %{added: purge_pending_of(result), removed: drained}}
+            {annotate_compile(result, compile_status), %{added: purge_pending_of(result), removed: drained}}
         end
     end
   end
@@ -554,21 +559,57 @@ defmodule DexterousHMR do
     case Keyword.get(config, :compile_fun) do
       fun when is_function(fun, 0) ->
         fun.()
-        :ok
+        {:ok, :custom}
 
       _ ->
         # Mix ships with the toolchain, not with the app: dispatch
         # dynamically and fail cleanly when it is genuinely absent (e.g. in
         # a release), instead of crashing on an undefined function.
         if Code.ensure_loaded?(Mix) and Code.ensure_loaded?(Mix.Task) do
+          # "compile" delegates to "compile.all", which delegates to each
+          # compiler ("compile.elixir", …): every link of the chain is a Mix
+          # task, and an un-reenabled link silently no-ops the whole compile
+          # under `mix run` (where all of them ran at startup).
+          Kernel.apply(Mix.Task, :reenable, ["compile.all"])
           Kernel.apply(Mix.Task, :reenable, ["compile.elixir"])
           Kernel.apply(Mix.Task, :reenable, ["compile"])
-          Kernel.apply(Mix.Task, :run, ["compile"])
-          :ok
+          {status, _diagnostics} = Kernel.apply(Mix.Task, :run, ["compile"])
+          {:ok, status}
         else
           {:error, :mix_not_available}
         end
     end
+  end
+
+  # The compile did real work but no *loaded* module changed: the compiled
+  # sources belong to modules not currently loaded (a fresh module is only
+  # written to the code path and loads lazily on first call). Surface that in
+  # the report, or a bare "no changes" misleads.
+  defp annotate_compile({:ok, report}, :ok), do: {:ok, Map.put(report, :compile, :ok)}
+  defp annotate_compile(result, _status), do: result
+
+  # Load the on-disk beam of every loaded-and-watched module whose binary the
+  # compile replaced. The in-VM binary is compared with the file's, so an
+  # unchanged module is never re-purged. Returns the reloaded modules.
+  defp load_changed_beams(watch_dirs) do
+    :code.all_loaded()
+    |> Enum.filter(fn {mod, _} -> watched?(mod, watch_dirs) end)
+    |> Enum.flat_map(fn {mod, _} ->
+      with {^mod, old_binary, file} <- :code.get_object_code(mod),
+           true <- is_list(file),
+           {:ok, new_binary} <- File.read(to_string(file)),
+           true <- new_binary != old_binary do
+        # Purge the old version, then load: the running current becomes the
+        # old version (staying resumable for rollback) and the new binary
+        # becomes current. No :code.delete — that would occupy the old slot
+        # and make load_binary answer :not_purged.
+        :code.purge(mod)
+        {:module, ^mod} = :code.load_binary(mod, file, new_binary)
+        [mod]
+      else
+        _ -> []
+      end
+    end)
   end
 
   # Pre-compile object code of every watched module; rollback restores these
